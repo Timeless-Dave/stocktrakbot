@@ -1,15 +1,19 @@
 """
-main.py – The Conductor
-Runs headless, continuous, fault-tolerant trading across all asset classes.
-Market-hours gate uses pytz (US/Eastern) — only consumes Gemini quota during
-active trading hours to stay under the 1,500 req/day free-tier cap.
+main.py – The Conductor (Batch Processing Edition)
+Three-phase cycle per iteration:
+  PHASE 1 – Ingest:  Fetch data for all assets from yfinance (free, no Gemini)
+  PHASE 2 – Analyse: ONE Gemini API call for the entire portfolio
+  PHASE 3 – Execute: Trade each asset that beat the confidence threshold
+
+API call math:
+  Before: 29 tickers × 4 cycles/hr = 116 Gemini calls/hr  → daily limit hit
+  After:   1 batch  × 4 cycles/hr =   4 Gemini calls/hr  → 26 calls/trading day
 """
 import sys
 import time
 import pytz
 from datetime import datetime
 
-# Force UTF-8 so all print calls work on Windows terminals
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
@@ -18,7 +22,6 @@ from config import (
     TRADE_QUANTITY,
     CONFIDENCE_THRESHOLD,
     CYCLE_SLEEP_SECONDS,
-    TICKER_SLEEP_SECONDS,
     MAX_FETCH_RETRIES,
     HEADLESS,
     CRYPTO_ALWAYS_ON,
@@ -36,24 +39,20 @@ def ts() -> str:
 
 
 def is_market_open() -> bool:
-    """
-    Returns True when US equity markets are open (Mon-Fri 9:30-16:00 ET).
-    Uses pytz for correct DST handling regardless of system timezone.
-    """
+    """Returns True when US equity markets are open (9:30–16:00 ET, Mon–Fri)."""
     tz  = pytz.timezone("US/Eastern")
     now = datetime.now(tz)
-    if now.weekday() >= 5:          # Saturday=5, Sunday=6
+    if now.weekday() >= 5:
         return False
-    market_open  = now.replace(hour=9,  minute=30, second=0, microsecond=0)
-    market_close = now.replace(hour=16, minute=0,  second=0, microsecond=0)
-    return market_open <= now < market_close
+    open_  = now.replace(hour=9,  minute=30, second=0, microsecond=0)
+    close_ = now.replace(hour=16, minute=0,  second=0, microsecond=0)
+    return open_ <= now < close_
 
 
 class TradingBot:
-    """Orchestrates fetch -> analyse -> execute across all asset classes."""
 
     def __init__(self) -> None:
-        print(f"[{ts()}] [System] Initialising HBCU Stock Market Bot...")
+        print(f"[{ts()}] [System] Initialising HBCU Stock Market Bot (Batch Mode)...")
         validate_config()
 
         self.eyes   = MarketDataFetcher()
@@ -62,94 +61,96 @@ class TradingBot:
 
         if not self.hands.login(STOCKTRAK_USER, STOCKTRAK_PASS):
             self.hands.close()
-            raise RuntimeError("[System] Could not log in — aborting.")
+            raise RuntimeError("[System] Login failed — aborting.")
 
-        # Position tracker: prevents doubling into the same side
+        # Track open positions to avoid doubling in / naked shorts
         self.positions: dict[str, str | None] = {}
 
         total = sum(len(v) for v in WATCHLIST.values())
-        print(f"[{ts()}] [System] Online. Watching {total} assets across "
-              f"{len(WATCHLIST)} classes. "
-              f"Inter-call gap: {TICKER_SLEEP_SECONDS}s.")
+        print(f"[{ts()}] [System] Online. {total} assets | 1 Gemini call/cycle")
         print("-" * 60)
 
     # ─────────────────────────────────────────────────────────────────────────
-    def _fetch_with_retry(self, ticker: str, asset_class: str) -> dict | None:
-        for attempt in range(MAX_FETCH_RETRIES):
-            data = self.eyes.fetch_full_data(ticker, asset_class)
-            if data:
-                return data
-            wait = 2 ** attempt
-            print(f"[{ts()}] [Warning] Fetch failed for {ticker}. Retry in {wait}s...")
-            time.sleep(wait)
-        print(f"[{ts()}] [Error] Max retries for {ticker}. Skipping.")
-        return None
+    def _ingest_all(self, market_open: bool) -> dict:
+        """
+        PHASE 1 — Data Ingestion.
+        Fetch yfinance data for every asset. Zero Gemini calls here.
+        Sleeps 1s between tickers to be polite to Yahoo Finance.
+        """
+        print(f"[{ts()}] [Ingest] Fetching market data for all assets...")
+        matrix: dict = {}
 
-    # ─────────────────────────────────────────────────────────────────────────
-    def _process_ticker(self, ticker: str, asset_class: str) -> None:
-        # 1. Fetch
-        data = self._fetch_with_retry(ticker, asset_class)
-        if not data:
-            return
-
-        price = data.get("current_price", "N/A")
-        print(f"[{ts()}] [Data]  {ticker} ({asset_class}) @ ${price}")
-
-        # 2. Analyse
-        decision   = self.brain.analyze_asset(ticker, data, asset_class)
-        action     = decision.get("action", "HOLD")
-        confidence = decision.get("confidence", 0)
-        reasoning  = decision.get("reasoning", "--")
-
-        tag = {"BUY": "[BUY]", "SELL": "[SELL]", "HOLD": "[HOLD]"}.get(action, "[?]")
-        print(f"[{ts()}] [Brain] {tag} {ticker} | conf={confidence}% | {reasoning}")
-
-        # 3. Position guard — no duplicate sides, no naked sells
-        current = self.positions.get(ticker)
-        if action == "BUY"  and current == "long":
-            print(f"[{ts()}] [Skip]  Already long {ticker} — skipping duplicate BUY.")
-            return
-        if action == "SELL" and current is None:
-            print(f"[{ts()}] [Skip]  No position in {ticker} — nothing to SELL.")
-            return
-
-        # 4. Execute trade if confidence >= threshold
-        if action in ("BUY", "SELL") and confidence >= CONFIDENCE_THRESHOLD:
-            note  = (f"[{action}] {ticker} ({asset_class}) — "
-                     f"{reasoning} (conf: {confidence}%)")
-            ok    = self.hands.execute_trade(ticker, action, TRADE_QUANTITY,
-                                             asset_class=asset_class, notes=note)
-            label = "SUCCESS" if ok else "FAILED"
-            print(f"[{ts()}] [{label}] {action} {TRADE_QUANTITY}x {ticker}")
-            if ok:
-                self.positions[ticker] = "long" if action == "BUY" else None
-        else:
-            print(f"[{ts()}] [Skip]  {ticker} — conf {confidence}% < "
-                  f"{CONFIDENCE_THRESHOLD}% or HOLD.")
-
-    # ─────────────────────────────────────────────────────────────────────────
-    def _run_cycle(self, market_open: bool) -> None:
-        print(f"[{ts()}] [System] -- New analysis cycle --")
         for asset_class, tickers in WATCHLIST.items():
-            # Crypto trades 24/7; everything else needs market hours
+            # Skip non-crypto when market is closed
             if not market_open and not (asset_class == "crypto" and CRYPTO_ALWAYS_ON):
                 continue
-            for ticker in tickers:
-                try:
-                    self._process_ticker(ticker, asset_class)
-                except Exception as exc:
-                    print(f"[{ts()}] [Error] {ticker}: {exc}")
-                # Mandatory gap between Gemini API calls (~15 RPM free-tier limit)
-                time.sleep(TICKER_SLEEP_SECONDS)
 
-        print("-" * 60)
-        print(f"[{ts()}] [System] Cycle done. Next run in "
-              f"{CYCLE_SLEEP_SECONDS // 60} min.")
+            for ticker in tickers:
+                for attempt in range(MAX_FETCH_RETRIES):
+                    data = self.eyes.fetch_full_data(ticker, asset_class)
+                    if data:
+                        matrix[ticker] = data
+                        break
+                    wait = 2 ** attempt
+                    print(f"[{ts()}] [Warning] {ticker} fetch failed. Retry in {wait}s...")
+                    time.sleep(wait)
+                else:
+                    print(f"[{ts()}] [Error] Could not fetch {ticker}. Skipping.")
+
+                time.sleep(1)   # 1s between yfinance calls (rate-limit courtesy)
+
+        print(f"[{ts()}] [Ingest] Matrix ready: {len(matrix)} assets.")
+        return matrix
+
+    # ─────────────────────────────────────────────────────────────────────────
+    def _execute_decisions(self, decisions: list) -> None:
+        """
+        PHASE 3 — Order Execution Queue.
+        Work through Gemini's ranked list and fire trades for high-confidence signals.
+        """
+        # Build a lookup of asset_class per ticker from the watchlist
+        class_map: dict[str, str] = {
+            t: cls for cls, tickers in WATCHLIST.items() for t in tickers
+        }
+
+        for decision in decisions:
+            ticker     = decision.get("ticker", "")
+            action     = decision.get("action",     "HOLD")
+            confidence = decision.get("confidence", 0)
+            reasoning  = decision.get("reasoning",  "--")
+
+            tag = {"BUY": "[BUY]", "SELL": "[SELL]", "HOLD": "[HOLD]"}.get(action, "[?]")
+            print(f"[{ts()}] [Signal] {tag} {ticker:<10} conf={confidence}% | {reasoning}")
+
+            if action not in ("BUY", "SELL") or confidence < CONFIDENCE_THRESHOLD:
+                continue    # HOLD or below threshold — nothing to do
+
+            # Position guard
+            current = self.positions.get(ticker)
+            if action == "BUY"  and current == "long":
+                print(f"[{ts()}] [Skip]   Already long {ticker}.")
+                continue
+            if action == "SELL" and current is None:
+                print(f"[{ts()}] [Skip]   No position in {ticker} to sell.")
+                continue
+
+            asset_class = class_map.get(ticker, "stocks")
+            note = f"[{action}] {ticker} ({asset_class}) — {reasoning} (conf: {confidence}%)"
+
+            ok = self.hands.execute_trade(
+                ticker, action, TRADE_QUANTITY,
+                asset_class=asset_class,
+                notes=note,
+            )
+            label = "SUCCESS" if ok else "FAILED"
+            print(f"[{ts()}] [{label}]  {action} {TRADE_QUANTITY}x {ticker}")
+
+            if ok:
+                self.positions[ticker] = "long" if action == "BUY" else None
 
     # ─────────────────────────────────────────────────────────────────────────
     def run(self) -> None:
-        """Continuous loop. Sleeps 1 hour when market is closed to save quota."""
-        print(f"[{ts()}] [System] Bot is now active.")
+        print(f"[{ts()}] [System] Bot active.")
         try:
             while True:
                 open_now   = is_market_open()
@@ -160,24 +161,41 @@ class TradingBot:
                     time.sleep(3600)
                     continue
 
-                if not open_now and any_crypto:
-                    print(f"[{ts()}] [System] Market closed — running crypto only.")
+                if not open_now:
+                    print(f"[{ts()}] [System] Market closed — crypto-only cycle.")
 
-                self._run_cycle(market_open=open_now)
+                print(f"[{ts()}] [System] -- Batch Cycle Start --")
+
+                # PHASE 1: Ingest all data (no Gemini calls)
+                matrix = self._ingest_all(market_open=open_now)
+
+                if not matrix:
+                    print(f"[{ts()}] [Warning] Empty matrix — skipping analysis.")
+                    time.sleep(CYCLE_SLEEP_SECONDS)
+                    continue
+
+                # PHASE 2: ONE batch Gemini call
+                decisions = self.brain.analyze_portfolio(matrix)
+
+                if not decisions:
+                    print(f"[{ts()}] [Warning] No decisions returned from Gemini.")
+                else:
+                    # PHASE 3: Execute trades
+                    self._execute_decisions(decisions)
+
+                print("-" * 60)
+                print(f"[{ts()}] [System] Cycle done. Next in {CYCLE_SLEEP_SECONDS // 60} min.")
                 time.sleep(CYCLE_SLEEP_SECONDS)
 
         except KeyboardInterrupt:
-            print(f"\n[{ts()}] [System] Shutdown requested (Ctrl+C)...")
-
+            print(f"\n[{ts()}] [System] Shutdown requested...")
         except Exception as exc:
             print(f"\n[{ts()}] [Fatal] {exc}")
-
         finally:
             self.hands.close()
             print(f"[{ts()}] [System] Bot terminated. Goodbye!")
 
 
-# ── Entry ─────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     bot = TradingBot()
     bot.run()
