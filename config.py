@@ -1,46 +1,55 @@
 """
 config.py – Centralized configuration loader.
-Reads all credentials and settings from environment variables (or a .env file).
 """
 import os
 from dotenv import load_dotenv
 
-# Load variables from a .env file in the project root (if it exists)
 load_dotenv()
 
-# ── Gemini ──────────────────────────────────────────────────────────────────
+# ── Gemini ───────────────────────────────────────────────────────────────────
 GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
 
 # ── Stock-Trak ───────────────────────────────────────────────────────────────
 STOCKTRAK_USER: str = os.getenv("STOCKTRAK_USER", "")
 STOCKTRAK_PASS: str = os.getenv("STOCKTRAK_PASS", "")
-STOCKTRAK_BASE_URL: str = "https://www.stocktrak.com"
+
+# ── Watchlist (organized by asset class) ─────────────────────────────────────
+WATCHLIST: dict[str, list[str]] = {
+    "stocks": [
+        "PLTR", "MCD", "JNJ", "PEP", "NOW", "INTU",
+        "MSFT", "NVDA", "GE", "AAPL", "AMZN", "META",
+    ],
+    "etfs": [
+        "SPY", "QQQ", "ITA", "GLD", "TLT", "VTI", "ARKK", "XLE",
+    ],
+    "crypto": [
+        "BTC-USD", "ETH-USD", "SOL-USD",
+    ],
+    "bonds": [
+        "BND", "AGG", "HYG",
+    ],
+    "mutual": [
+        "VFIAX", "FXAIX", "VTSAX",
+    ],
+}
+
+TARGET_TICKERS: list[str] = [t for tickers in WATCHLIST.values() for t in tickers]
 
 # ── Bot Behaviour ─────────────────────────────────────────────────────────────
-# Tickers to monitor every cycle
-TARGET_TICKERS: list[str] = ["PLTR", "MCD", "JNJ", "PEP", "NOW", "INTU"]
-
-# Shares to buy / sell per confirmed signal
 TRADE_QUANTITY: int = 15
-
-# Minimum Gemini confidence score (0-100) required before executing a trade
 CONFIDENCE_THRESHOLD: int = 75
-
-# Seconds to sleep between full analysis cycles (15 min = 900 s)
-CYCLE_SLEEP_SECONDS: int = 900
-
-# Seconds to sleep between individual ticker checks within a cycle
-TICKER_SLEEP_SECONDS: int = 5
-
-# Max retries for data fetching with exponential back-off
+CYCLE_SLEEP_SECONDS: int = 900       # 15 min between cycles
 MAX_FETCH_RETRIES: int = 3
+HEADLESS: bool = True
+CRYPTO_ALWAYS_ON: bool = True        # crypto analysed even when market closed
 
-# Run the Playwright browser visibly (False) or in the background (True)
-HEADLESS: bool = False
+# How long to sleep BETWEEN each ticker's API call (keeps us under ~15 RPM).
+# Math: 29 tickers × 6s = 174s/cycle ≈ 3 min.  4 cycles/hr = 116 calls/hr.
+# Over a 6.5-hr trading day ≈ 754 calls — well under the 1,500/day free-tier cap.
+TICKER_SLEEP_SECONDS: int = 6
 
 # ── Validation ────────────────────────────────────────────────────────────────
 def validate_config() -> None:
-    """Raise an error early if critical environment variables are missing."""
     missing = []
     if not GEMINI_API_KEY:
         missing.append("GEMINI_API_KEY")
@@ -50,6 +59,6 @@ def validate_config() -> None:
         missing.append("STOCKTRAK_PASS")
     if missing:
         raise EnvironmentError(
-            f"[Config] Missing required environment variables: {', '.join(missing)}\n"
+            f"[Config] Missing required env vars: {', '.join(missing)}\n"
             "Copy .env.example to .env, fill in the values, and re-run."
         )
