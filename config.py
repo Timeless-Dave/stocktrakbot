@@ -6,8 +6,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# ── Gemini ───────────────────────────────────────────────────────────────────
-GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
+# ── OpenAI ───────────────────────────────────────────────────────────────────
+OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
 
 # ── Stock-Trak ───────────────────────────────────────────────────────────────
 STOCKTRAK_USER: str = os.getenv("STOCKTRAK_USER", "")
@@ -51,8 +51,8 @@ TICKER_SLEEP_SECONDS: int = 6
 # ── Validation ────────────────────────────────────────────────────────────────
 def validate_config() -> None:
     missing = []
-    if not GEMINI_API_KEY:
-        missing.append("GEMINI_API_KEY")
+    if not OPENAI_API_KEY:
+        missing.append("OPENAI_API_KEY")
     if not STOCKTRAK_USER:
         missing.append("STOCKTRAK_USER")
     if not STOCKTRAK_PASS:

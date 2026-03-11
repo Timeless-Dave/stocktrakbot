@@ -1,77 +1,74 @@
 """
-brain.py – The Brain (Batch Processing Edition)
-O(1) Gemini API calls per cycle instead of O(N).
-Sends the entire market matrix in one prompt; Gemini ranks all assets
-against each other and returns a JSON array of decisions.
+brain.py – The Brain (OpenAI Structured Outputs Edition)
+O(1) API calls per cycle — sends the entire market matrix in a single request.
+OpenAI's Structured Outputs (Pydantic schema) guarantee 100% valid JSON every time;
+no markdown leakage, no KeyError crashes, no retries needed for parsing failures.
 """
 import os
 import json
+from openai import OpenAI
+from pydantic import BaseModel, Field
 from dotenv import load_dotenv
-from google import genai
-from google.genai import types
 
+
+# ── Pydantic schema — enforced at the token-generation level by OpenAI ────────
+
+class TradeDecision(BaseModel):
+    ticker: str = Field(description="The asset ticker symbol, e.g. AAPL or BTC-USD.")
+    action: str = Field(description="Exactly one of: BUY, SELL, or HOLD.")
+    confidence: int = Field(
+        description=(
+            "Integer 1-100. Only exceed 75 for strict technical+fundamental confluence. "
+            "Mixed signals must stay below 50 with HOLD."
+        )
+    )
+    reasoning: str = Field(description="One concise sentence citing the key signals.")
+
+
+class PortfolioDecisions(BaseModel):
+    decisions: list[TradeDecision]
+
+
+# ── System prompt — aggressive, relative-strength mandate for gpt-4o-mini ─────
 
 _SYSTEM_PROMPT = """
-You are a ruthless quantitative trading algorithm managing a diversified portfolio.
-You will receive a "Market Matrix" containing technical and fundamental data for
-multiple assets simultaneously.
+You are a highly aggressive, relative-value quantitative hedge fund manager.
+You are evaluating a matrix of assets. Your mandate is to deploy capital, not to sit in cash.
+You must abandon the search for "perfect" setups. Instead, look for RELATIVE STRENGTH and MOMENTUM.
 
-ASSET CLASSES in the matrix:
-  • stocks  – equities (RSI, MACD, Bollinger Bands, P/E, EPS, news, analyst rec)
-  • etfs    – exchange-traded funds (trend + momentum focus)
-  • crypto  – 24/7 digital assets (higher volatility thresholds required)
-  • bonds   – fixed-income ETFs (inverse rate plays)
-  • mutual  – mutual funds (end-of-day NAV; high bar for trading)
-
-MANDATORY CONFLUENCE RULES:
-1. Rank ALL assets. Only assign confidence > 75 to the BEST setups where
-   multiple independent signal types agree simultaneously:
-     BUY confluence  → price near/below Lower Bollinger Band AND RSI < 38
-                       AND MACD histogram turning positive AND, for equities,
-                       reasonable P/E + positive earnings/revenue growth.
-     SELL confluence → price near/above Upper Bollinger Band AND RSI > 68
-                       AND MACD histogram falling.
-2. If signals conflict (e.g., RSI oversold but MACD still negative), output
-   HOLD with confidence < 50. Do NOT force a signal.
-3. Compare assets RELATIVELY — the best risk/reward ratio in the batch should
-   get the highest confidence. Not every cycle needs a > 75 signal.
-4. Catastrophic negative news overrides bullish technicals.
-5. Crypto: require RSI < 35 or > 72 for any confidence > 60.
-6. Mutual funds: require price_change_5d < -3% + RSI < 38 for BUY.
-7. OUTPUT: a JSON array with exactly one object per asset in the matrix.
-   Required keys: ticker, action (BUY/SELL/HOLD), confidence (1-100), reasoning (one sentence).
+RULES FOR EXECUTION:
+1. MANDATORY ACTION: You MUST identify the top 2 to 3 most bullish assets in this matrix and
+   assign them a "BUY" action with a confidence score BETWEEN 80 AND 95.
+2. BULLISH CRITERIA: Prioritize assets with RSI between 45 and 65 that are bouncing off their
+   Lower Bollinger Band, or have strong positive news catalysts, even if MACD is slightly lagging.
+3. MANDATORY SHORT/SELL: You MUST identify the 1 or 2 most overextended assets
+   (e.g., RSI > 70, hitting Upper Bollinger Band, negative news) and assign them a "SELL" action
+   with a confidence > 80.
+4. THE REST: The remaining assets that lack clear momentum should be assigned "HOLD"
+   with a confidence of 45.
+5. DO NOT BE CAUTIOUS. Your job is to find the best available trades in the current matrix,
+   even if the overall market conditions are mixed.
+6. OUTPUT COVERAGE: For every asset in the market matrix, you MUST return exactly one decision
+   object {ticker, action, confidence, reasoning}. Never omit any ticker.
+7. RELATIVE RANKING: Confidence scores must reflect relative ranking across the matrix so that
+   the strongest BUY and SELL candidates clearly stand out above the HOLDs.
 """.strip()
 
-# Response schema: array of per-asset decisions
-_RESPONSE_SCHEMA = {
-    "type": "array",
-    "items": {
-        "type": "object",
-        "properties": {
-            "ticker":     {"type": "string"},
-            "action":     {"type": "string", "enum": ["BUY", "SELL", "HOLD"]},
-            "confidence": {"type": "integer",
-                           "description": "1-100; >75 requires strict confluence."},
-            "reasoning":  {"type": "string",
-                           "description": "One sentence citing the key signals."},
-        },
-        "required": ["ticker", "action", "confidence", "reasoning"],
-    },
-}
 
+# ── TradingBrain ──────────────────────────────────────────────────────────────
 
 class TradingBrain:
-    """Single-call batch analyser: one Gemini request for the entire portfolio."""
+    """Single-call batch analyser: one OpenAI request for the entire portfolio."""
 
     def __init__(self) -> None:
         load_dotenv()
-        api_key = os.environ.get("GEMINI_API_KEY", "")
+        api_key = os.environ.get("OPENAI_API_KEY", "")
         if not api_key:
             raise EnvironmentError(
-                "[Brain] GEMINI_API_KEY not set. Fill in your .env file."
+                "[Brain] OPENAI_API_KEY not set. Add it to your .env file."
             )
-        self._client = genai.Client(api_key=api_key)
-        self._model  = "gemini-2.0-flash"
+        self._client = OpenAI(api_key=api_key)
+        self._model  = "gpt-4o-mini"
 
     # ─────────────────────────────────────────────────────────────────────────
     def analyze_portfolio(self, market_matrix: dict) -> list[dict]:
@@ -88,7 +85,7 @@ class TradingBrain:
         Returns [] on failure (caller treats all as HOLD).
         """
         n = len(market_matrix)
-        print(f"[Brain] Batch-analysing {n} assets in 1 API call...")
+        print(f"[Brain] Batch-analysing {n} assets via OpenAI gpt-4o-mini...")
 
         # Compact the matrix — drop internal bookkeeping keys to save tokens
         _DROP = {"last_updated", "asset_class"}
@@ -97,7 +94,7 @@ class TradingBrain:
             for tkr, data in market_matrix.items()
         }
 
-        # Add asset_class as a top-level label per ticker (saves prompt tokens vs nesting)
+        # Add per-ticker asset-class labels as a brief prefix
         asset_labels = "\n".join(
             f"  {tkr}: {data.get('asset_class', 'stocks')}"
             for tkr, data in market_matrix.items()
@@ -107,23 +104,25 @@ class TradingBrain:
             f"Asset-class labels:\n{asset_labels}\n\n"
             f"Market Matrix ({n} assets):\n"
             f"{json.dumps(compact, indent=2)}\n\n"
-            "Apply your confluence rules and return the execution list for ALL assets."
+            "Apply your confluence rules and return decisions for ALL assets listed."
         )
 
         try:
-            response = self._client.models.generate_content(
+            # parse() enforces the Pydantic schema at the token level — guaranteed JSON
+            response = self._client.beta.chat.completions.parse(
                 model=self._model,
-                contents=user_prompt,
-                config=types.GenerateContentConfig(
-                    system_instruction=_SYSTEM_PROMPT,
-                    response_mime_type="application/json",
-                    response_schema=_RESPONSE_SCHEMA,
-                    temperature=0.10,       # Very low — consistent, deterministic ranking
-                    max_output_tokens=1024, # Enough for 29 × ~25-token objects
-                ),
+                messages=[
+                    {"role": "system", "content": _SYSTEM_PROMPT},
+                    {"role": "user",   "content": user_prompt},
+                ],
+                response_format=PortfolioDecisions,
+                temperature=0.10,       # Low temp → consistent, deterministic ranking
+                max_tokens=1024,        # Sufficient for 29 × ~25-token decision objects
             )
-            decisions: list = json.loads(response.text)
-            print(f"[Brain] Received {len(decisions)} decisions from Gemini.")
+
+            parsed: PortfolioDecisions = response.choices[0].message.parsed
+            decisions = [d.model_dump() for d in parsed.decisions]
+            print(f"[Brain] Received {len(decisions)} decisions from OpenAI.")
             return decisions
 
         except Exception as exc:
@@ -131,7 +130,7 @@ class TradingBrain:
             return []
 
 
-# ── Standalone test ───────────────────────────────────────────────────────────
+# ── Standalone smoke-test ─────────────────────────────────────────────────────
 if __name__ == "__main__":
     load_dotenv()
     b = TradingBrain()

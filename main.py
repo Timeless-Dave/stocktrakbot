@@ -1,13 +1,13 @@
 """
 main.py – The Conductor (Batch Processing Edition)
 Three-phase cycle per iteration:
-  PHASE 1 – Ingest:  Fetch data for all assets from yfinance (free, no Gemini)
-  PHASE 2 – Analyse: ONE Gemini API call for the entire portfolio
+  PHASE 1 – Ingest:  Fetch data for all assets from yfinance (no OpenAI calls)
+  PHASE 2 – Analyse: ONE OpenAI API call for the entire portfolio
   PHASE 3 – Execute: Trade each asset that beat the confidence threshold
 
 API call math:
-  Before: 29 tickers × 4 cycles/hr = 116 Gemini calls/hr  → daily limit hit
-  After:   1 batch  × 4 cycles/hr =   4 Gemini calls/hr  → 26 calls/trading day
+  Before: 29 tickers × 4 cycles/hr = 116 OpenAI calls/hr  → daily limit hit
+  After:   1 batch  × 4 cycles/hr =   4 OpenAI calls/hr  → 26 calls/trading day
 """
 import sys
 import time
@@ -67,14 +67,14 @@ class TradingBot:
         self.positions: dict[str, str | None] = {}
 
         total = sum(len(v) for v in WATCHLIST.values())
-        print(f"[{ts()}] [System] Online. {total} assets | 1 Gemini call/cycle")
+        print(f"[{ts()}] [System] Online. {total} assets | 1 OpenAI call/cycle")
         print("-" * 60)
 
     # ─────────────────────────────────────────────────────────────────────────
     def _ingest_all(self, market_open: bool) -> dict:
         """
         PHASE 1 — Data Ingestion.
-        Fetch yfinance data for every asset. Zero Gemini calls here.
+        Fetch yfinance data for every asset. Zero OpenAI calls here.
         Sleeps 1s between tickers to be polite to Yahoo Finance.
         """
         print(f"[{ts()}] [Ingest] Fetching market data for all assets...")
@@ -106,7 +106,7 @@ class TradingBot:
     def _execute_decisions(self, decisions: list) -> None:
         """
         PHASE 3 — Order Execution Queue.
-        Work through Gemini's ranked list and fire trades for high-confidence signals.
+        Work through the model's ranked list and fire trades for high-confidence signals.
         """
         # Build a lookup of asset_class per ticker from the watchlist
         class_map: dict[str, str] = {
@@ -166,7 +166,7 @@ class TradingBot:
 
                 print(f"[{ts()}] [System] -- Batch Cycle Start --")
 
-                # PHASE 1: Ingest all data (no Gemini calls)
+                # PHASE 1: Ingest all data (no OpenAI calls)
                 matrix = self._ingest_all(market_open=open_now)
 
                 if not matrix:
@@ -174,11 +174,11 @@ class TradingBot:
                     time.sleep(CYCLE_SLEEP_SECONDS)
                     continue
 
-                # PHASE 2: ONE batch Gemini call
+                # PHASE 2: ONE batch OpenAI call
                 decisions = self.brain.analyze_portfolio(matrix)
 
                 if not decisions:
-                    print(f"[{ts()}] [Warning] No decisions returned from Gemini.")
+                    print(f"[{ts()}] [Warning] No decisions returned from OpenAI.")
                 else:
                     # PHASE 3: Execute trades
                     self._execute_decisions(decisions)

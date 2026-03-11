@@ -1,10 +1,10 @@
-# 📈 StockTrakBot — HBCUStockMarketChallenge2026
+## 📈 StockTrakBot — HBCUStockMarketChallenge2026
 
-An AI-powered, terminal-based trading bot for the **Stock-Trak paper trading simulation**. It uses live market data, Gemini 2.0 Flash for analysis, and Playwright browser automation to execute trades — all from a single terminal window with zero UI required.
+An AI-powered, terminal-based trading bot for the **Stock-Trak paper trading simulation**. It uses live market data, OpenAI (gpt-4o-mini with Structured Outputs) for analysis, and Playwright browser automation to execute trades — all from a single terminal window with zero UI required.
 
 ---
 
-## 🏗️ Architecture — The 3-Pillar System
+### 🏗️ Architecture — The 3-Pillar System
 
 ```
 stock_bot/
@@ -12,7 +12,7 @@ stock_bot/
 ├── main.py            ← 🎯 Orchestrator: runs the continuous trading loop
 ├── config.py          ← ⚙️  All settings + env variable loader
 ├── data_fetcher.py    ← 👁️  The Eyes: yfinance + RSI/MACD/SMA via `ta`
-├── brain.py           ← 🧠  The Brain: Gemini API → strict JSON decisions
+├── brain.py           ← 🧠  The Brain: OpenAI API → structured JSON decisions
 ├── executor.py        ← 🤝  The Hands: Playwright automates Stock-Trak UI
 │
 ├── requirements.txt   ← Python dependencies
@@ -22,22 +22,22 @@ stock_bot/
 └── README.md          ← You are here
 ```
 
-### How It Works
+#### How It Works
 
 ```
 Every 15 minutes (market hours only):
   For each ticker in watchlist:
     1. Eyes   → fetch live OHLCV + RSI-14, MACD, SMA-20
-    2. Brain  → send data to Gemini → get { action, confidence, reasoning }
+    2. Brain  → send data to OpenAI → get { action, confidence, reasoning }
     3. Hands  → if confidence ≥ 75 and action is BUY/SELL → execute on Stock-Trak
     4. Log    → print timestamped result to terminal
 ```
 
 ---
 
-## ⚡ Quickstart
+### ⚡ Quickstart
 
-### 1. Clone & Install
+#### 1. Clone & Install
 
 ```bash
 git clone https://github.com/Timeless-Dave/stocktrakbot.git
@@ -46,7 +46,7 @@ pip install -r requirements.txt
 python -m playwright install chromium
 ```
 
-### 2. Configure Credentials
+#### 2. Configure Credentials
 
 ```bash
 cp .env.example .env
@@ -54,14 +54,14 @@ cp .env.example .env
 
 Edit `.env`:
 ```env
-GEMINI_API_KEY=your_gemini_key_from_aistudio.google.com
+OPENAI_API_KEY=your_openai_api_key_here
 STOCKTRAK_USER=your_stocktrak_username
 STOCKTRAK_PASS=your_stocktrak_password
 ```
+ 
+Get an OpenAI API key from the [OpenAI dashboard](https://platform.openai.com/).
 
-Get a free Gemini API key at [aistudio.google.com](https://aistudio.google.com).
-
-### 3. Fix Selectors (one-time setup)
+#### 3. Fix Selectors (one-time setup)
 
 Open `executor.py` and update the CSS selectors marked `# ← UPDATE` by:
 1. Logging into Stock-Trak manually in your browser
@@ -70,7 +70,7 @@ Open `executor.py` and update the CSS selectors marked `# ← UPDATE` by:
 
 Set `HEADLESS = False` in `config.py` while doing this so you can watch the bot.
 
-### 4. Run
+#### 4. Run
 
 ```bash
 python main.py
@@ -80,19 +80,19 @@ Press `Ctrl+C` to stop. The browser closes cleanly.
 
 ---
 
-## 🔧 Configuration (`config.py`)
+### 🔧 Configuration (`config.py`)
 
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `TARGET_TICKERS` | `["PLTR","MCD","JNJ","PEP","NOW","INTU"]` | Stocks to monitor |
 | `TRADE_QUANTITY` | `15` | Shares per order |
-| `CONFIDENCE_THRESHOLD` | `75` | Min Gemini confidence to execute |
+| `CONFIDENCE_THRESHOLD` | `75` | Min model confidence to execute |
 | `CYCLE_SLEEP_SECONDS` | `900` | Time between full cycles (15 min) |
 | `HEADLESS` | `False` | `True` = invisible browser, `False` = visible |
 
 ---
 
-## 📊 Sample Terminal Output
+### 📊 Sample Terminal Output
 
 ```
 [09:35:01] [System] Initialising HBCUStockMarketChallenge2026 Bot…
@@ -112,29 +112,29 @@ Press `Ctrl+C` to stop. The browser closes cleanly.
 
 ---
 
-## 🛡️ Error Handling
+### 🛡️ Error Handling
 
 - **Exponential back-off** on data fetch failures (1s → 2s → 4s)
 - **Playwright TimeoutError** caught per-trade — never crashes the main loop
-- **Gemini failsafe** — any API error returns `HOLD` with 0% confidence
+- **AI failsafe** — any analysis error returns `HOLD` with 0% confidence
 - **Market hours gate** — bot sleeps automatically outside 9:30 AM – 4:00 PM ET
 - **Graceful shutdown** — `Ctrl+C` closes the browser cleanly via `finally` block
 
 ---
 
-## 📦 Tech Stack
+### 📦 Tech Stack
 
 | Layer | Library | Purpose |
 |-------|---------|---------|
 | Market Data | `yfinance` | Free OHLCV data (NYSE/NASDAQ) |
 | Indicators | `ta` | RSI-14, MACD (12/26/9), SMA-20 |
-| AI Analysis | `google-genai` (Gemini 2.0 Flash) | Structured JSON trade decisions |
+| AI Analysis | `openai` (gpt-4o-mini Structured Outputs) | Structured JSON trade decisions |
 | Automation | `playwright` (Chromium) | Headless Stock-Trak browser control |
 | Config | `python-dotenv` | Secure credential management |
 
 ---
 
-## ⚠️ Disclaimer
+### ⚠️ Disclaimer
 
 This bot is built for the **HBCUStockMarketChallenge2026 paper trading simulation** only.
 It does not interact with real financial markets or real money.

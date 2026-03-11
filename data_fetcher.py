@@ -26,7 +26,7 @@ class MarketDataFetcher:
     ) -> dict | None:
         """
         Download OHLCV + fundamentals, compute technicals, cache & return a
-        flat dict ready for the Gemini prompt.
+        flat dict ready for the OpenAI prompt.
         """
         print(f"[Data] Fetching {asset_class.upper()} data for {ticker}...")
         try:
@@ -145,7 +145,7 @@ class MarketDataFetcher:
         except Exception:
             pass
 
-        # Recent news headlines (top 2) — feed sentiment to Gemini
+        # Recent news headlines (top 2) — feed sentiment to the model
         try:
             news = tkr.news or []
             headlines = [
