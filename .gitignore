@@ -3,3 +3,7 @@ __pycache__/
 *.pyc
 *.pyo
 .DS_Store
+
+# Debug screenshots — kept locally for diagnostics, not needed in remote repo
+debug_screenshots/
+debug_*.png
