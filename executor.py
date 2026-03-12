@@ -265,12 +265,43 @@ class StockTrakExecutor:
         action = action.upper()
         print(f"[Executor] Navigating to Crypto UI for {ticker}…")
 
+        # Error phrases that block order progression — checked at multiple points
+        _ERROR_PHRASES = [
+            "requires an existing long position",
+            "cancel pending orders",
+            "you do not have sufficient",
+            "order cannot be placed",
+            "cannot place a sell order",
+            "no shares to sell",
+            "short selling is not allowed",
+            "exceed maximum position size",
+            "require you to enter a note",
+        ]
+
+        def _page_has_error() -> str | None:
+            """Scan page body for known error phrases. Returns matched phrase or None."""
+            try:
+                txt = self._page.locator("body").inner_text(timeout=2_000).lower()
+                for phrase in _ERROR_PHRASES:
+                    if phrase.lower() in txt:
+                        return phrase
+            except Exception:
+                pass
+            return None
+
         try:
             self._page.goto(self._CRYPTO_URL, wait_until="domcontentloaded", timeout=30_000)
             # Wait until the Trade Cryptos form is fully wired
             self._page.wait_for_selector(self._SEL_SYMBOL, timeout=15_000)
             time.sleep(1.5)
             self._dismiss_overlays()
+
+            # ── Guard: check for page-level errors immediately after load ─────
+            err = _page_has_error()
+            if err:
+                print(f"[Executor][Warning] Crypto page error for {ticker} before form fill: '{err}'.")
+                self._debug_screenshot(f"crypto_blocked_early_{ticker}_{action}")
+                return False
 
             # 1. Symbol — for crypto, search base (e.g. BTC) instead of BTC-USD
             base_symbol = ticker.split("-")[0] if "-" in ticker else ticker
@@ -289,15 +320,37 @@ class StockTrakExecutor:
             self._page.locator("label.button", has_text=label_text).first.click(timeout=8_000)
             time.sleep(0.5)
 
+            # ── Guard: check for errors after action selection ────────────────
+            err = _page_has_error()
+            if err:
+                print(f"[Executor][Warning] Crypto order blocked for {ticker} after action select: '{err}'.")
+                self._debug_screenshot(f"crypto_blocked_{ticker}_{action}")
+                return False
+
             # 3. Quantity
             qty_box = self._page.locator(self._SEL_QUANTITY)
             qty_box.click(timeout=5_000)
             qty_box.fill(str(quantity), timeout=5_000)
             time.sleep(0.5)
 
+            # ── 3b. Fill Trading Notes (may appear on order form page) ─────────
+            note_text = notes or self._auto_note(ticker, action)
+            self._fill_notes(note_text)
+
             # 4. Review Order → Confirm Order (same IDs as equities)
             self._page.locator(self._SEL_PREVIEW).click(timeout=8_000)
             time.sleep(2.0)
+
+            # ── 4b. Guard: check for error banners on the review page ─────────
+            err = _page_has_error()
+            if err:
+                print(f"[Executor][Warning] Crypto order blocked for {ticker} on review page: '{err}'.")
+                self._debug_screenshot(f"crypto_blocked_review_{ticker}_{action}")
+                return False
+
+            # ── 4c. Fill trading notes on the review page ──────────────────────
+            self._fill_notes(note_text)
+
             confirm_btn = self._page.locator(self._SEL_CONFIRM)
             confirm_btn.wait_for(state="visible", timeout=12_000)
             confirm_btn.click(timeout=10_000)
@@ -339,6 +392,8 @@ class StockTrakExecutor:
             "cannot place a sell order",
             "no shares to sell",
             "short selling is not allowed",
+            "exceed maximum position size",
+            "require you to enter a note",
         ]
 
         def _page_has_error() -> str | None:
