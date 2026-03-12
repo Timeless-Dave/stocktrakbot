@@ -23,8 +23,9 @@ class StockTrakExecutor:
     # Post-login dashboard landmark
     _DASHBOARD_URL   = "https://app.stocktrak.com/dashboard/standard"
 
-    # Trading page  (https://app.stocktrak.com/trading/equities)
+    # Trading pages
     _TRADING_URL     = "https://app.stocktrak.com/trading/equities"
+    _CRYPTO_URL      = "https://app.stocktrak.com/trading/cryptocurrency"
 
     # Trading form fields
     _SEL_SYMBOL      = "#tbSymbol"
@@ -108,9 +109,11 @@ class StockTrakExecutor:
         """
         if asset_class == "mutual":
             return self._execute_mutual_fund(ticker, action, quantity, notes)
-        else:
-            # stocks, ETFs, crypto, bonds all use the equities trading page
-            return self._execute_equities(ticker, action, quantity, notes)
+        if asset_class == "crypto":
+            return self._execute_crypto(ticker, action, quantity, notes)
+        # stocks, ETFs, crypto, bonds all previously used the equities trading page;
+        # now equities/ETFs/bonds continue to use that flow, while crypto is routed separately.
+        return self._execute_equities(ticker, action, quantity, notes)
 
     def _execute_mutual_fund(self, ticker: str, action: str,
                              quantity: int, notes: str = "") -> bool:
@@ -118,6 +121,75 @@ class StockTrakExecutor:
         # TODO: Implement mutual fund trading logic
         print(f"[Executor][Warning] Mutual fund trading not yet implemented for {ticker}.")
         return False
+
+    def _execute_crypto(self, ticker: str, action: str,
+                        quantity: int, notes: str = "") -> bool:
+        """
+        Dedicated crypto execution engine.
+        Uses #tbSymbol, #tbQuantity; Buy/Sell via label.button; #btnPreviewOrder, #btnPlaceOrder.
+        """
+        if not self.logged_in:
+            print("[Executor][Warning] Not logged in — skipping crypto trade.")
+            return False
+
+        action = action.upper()
+        print(f"[Executor] Navigating to Crypto UI for {ticker}…")
+
+        try:
+            self._page.goto(self._CRYPTO_URL, wait_until="domcontentloaded", timeout=30_000)
+            time.sleep(1.5)
+            self._dismiss_overlays()
+
+            # 1. Symbol — wait for ui-autocomplete dropdown after typing
+            symbol_box = self._page.locator(self._SEL_SYMBOL)
+            symbol_box.click(timeout=5_000)
+            symbol_box.fill("", timeout=5_000)
+            symbol_box.type(ticker, delay=80)
+            time.sleep(1)   # Let ui-autocomplete-input dropdown appear
+            self._page.keyboard.press("Enter")
+            time.sleep(2)    # Let live quote load
+
+            # 2. Buy/Sell — radio labels: "Buy" / "Sell" (same pattern as equities)
+            label_text = "Buy" if action == "BUY" else "Sell"
+            self._page.locator("label.button", has_text=label_text).first.click(timeout=8_000)
+            time.sleep(0.5)
+
+            # 3. Quantity
+            qty_box = self._page.locator(self._SEL_QUANTITY)
+            qty_box.click(timeout=5_000)
+            qty_box.fill(str(quantity), timeout=5_000)
+            time.sleep(0.5)
+
+            # 4. Review Order → Confirm Order (same IDs as equities)
+            self._page.locator(self._SEL_PREVIEW).click(timeout=8_000)
+            time.sleep(2.0)
+            confirm_btn = self._page.locator(self._SEL_CONFIRM)
+            confirm_btn.wait_for(state="visible", timeout=12_000)
+            confirm_btn.click(timeout=10_000)
+            time.sleep(2.5)
+
+            # 5. Verify success
+            try:
+                self._page.wait_for_selector(self._SEL_SUCCESS, timeout=10_000)
+                print(f"[Executor] ✓ {action} CRYPTO order for {ticker} confirmed.")
+                return True
+            except PlaywrightTimeoutError:
+                current_url = self._page.url
+                if "confirmation" in current_url or "orderhistory" in current_url:
+                    print(f"[Executor] ✓ {action} CRYPTO order likely confirmed (URL: {current_url}).")
+                    return True
+                self._debug_screenshot(f"crypto_timeout_{ticker}")
+                print("[Executor][Warning] Could not verify crypto success banner.")
+                return False
+
+        except PlaywrightTimeoutError as exc:
+            print(f"[Executor][Error] Crypto UI timed out for {ticker}: {exc}")
+            self._debug_screenshot(f"crypto_timeout_{ticker}")
+            return False
+        except Exception as exc:
+            print(f"[Executor][Error] Unexpected error on crypto {ticker}: {exc}")
+            self._debug_screenshot(f"crypto_error_{ticker}_{action}")
+            return False
 
     def _execute_equities(self, ticker: str, action: str,
                           quantity: int, notes: str = "") -> bool:

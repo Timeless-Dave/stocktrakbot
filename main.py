@@ -51,13 +51,15 @@ def is_market_open() -> bool:
 
 class TradingBot:
 
-    def __init__(self) -> None:
+    def __init__(self, mega_universe: list[str] | None = None, top_n: int = 30) -> None:
         print(f"[{ts()}] [System] Initialising HBCU Stock Market Bot (Batch Mode)...")
         validate_config()
 
         self.eyes   = MarketDataFetcher()
         self.brain  = TradingBrain()
         self.hands  = StockTrakExecutor(headless=HEADLESS)
+        self.mega_universe = mega_universe
+        self.top_n = top_n
 
         if not self.hands.login(STOCKTRAK_USER, STOCKTRAK_PASS):
             self.hands.close()
@@ -66,7 +68,7 @@ class TradingBot:
         # Track open positions to avoid doubling in / naked shorts
         self.positions: dict[str, str | None] = {}
 
-        total = sum(len(v) for v in WATCHLIST.values())
+        total = len(self.mega_universe) if self.mega_universe else sum(len(v) for v in WATCHLIST.values())
         print(f"[{ts()}] [System] Online. {total} assets | 1 OpenAI call/cycle")
         print("-" * 60)
 
@@ -101,6 +103,25 @@ class TradingBot:
 
         print(f"[{ts()}] [Ingest] Matrix ready: {len(matrix)} assets.")
         return matrix
+
+    def _ingest_screened(self, market_open: bool) -> dict:
+        """
+        Two-stage pipeline ingest:
+        - Scan a large universe in parallel
+        - Send only top N by volume_surge_pct to the model (cost control)
+        """
+        universe = self.mega_universe or []
+        if not universe:
+            return {}
+
+        if not market_open:
+            # When market is closed, optionally run crypto-only
+            if CRYPTO_ALWAYS_ON:
+                universe = [t for t in universe if t.upper().endswith("-USD")]
+            else:
+                return {}
+
+        return self.eyes.screen_universe(universe, top_n=self.top_n, max_workers=10)
 
     # ─────────────────────────────────────────────────────────────────────────
     def _execute_decisions(self, decisions: list) -> None:
@@ -166,16 +187,24 @@ class TradingBot:
 
                 print(f"[{ts()}] [System] -- Batch Cycle Start --")
 
+                # Macro context (VIX + SPY 5d trend) — once per cycle
+                macro = self.eyes.fetch_macro_context()
+                print(f"[{ts()}] [Macro] VIX: {macro['VIX']} | SPY 5D: {macro['SPY_5D_Trend_Pct']}%")
+
                 # PHASE 1: Ingest all data (no OpenAI calls)
-                matrix = self._ingest_all(market_open=open_now)
+                if self.mega_universe:
+                    matrix = self._ingest_screened(market_open=open_now)
+                else:
+                    matrix = self._ingest_all(market_open=open_now)
 
                 if not matrix:
                     print(f"[{ts()}] [Warning] Empty matrix — skipping analysis.")
                     time.sleep(CYCLE_SLEEP_SECONDS)
                     continue
 
-                # PHASE 2: ONE batch OpenAI call
-                decisions = self.brain.analyze_portfolio(matrix)
+                # PHASE 2: ONE batch OpenAI call (matrix + macro context)
+                owned = [t for t, pos in self.positions.items() if pos == "long"]
+                decisions = self.brain.analyze_portfolio(matrix, macro, owned_assets=owned)
 
                 if not decisions:
                     print(f"[{ts()}] [Warning] No decisions returned from OpenAI.")
@@ -197,5 +226,17 @@ class TradingBot:
 
 
 if __name__ == "__main__":
-    bot = TradingBot()
+    MEGA_UNIVERSE = [
+        # Big Tech & AI
+        "AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META", "TSLA", "TSM", "AVGO", "AMD",
+        # Momentum & High Volatility
+        "PLTR", "MCD", "JNJ", "PEP", "NOW", "INTU", "GE", "NFLX", "UBER", "CRWD",
+        "SNOW", "PANW", "SMCI", "COIN", "HOOD", "RBLX", "SHOP", "SPOT", "SQ", "ARM",
+        # Cryptos
+        "BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD", "ADA-USD",
+        # ETFs for broad exposure
+        "SPY", "QQQ", "IWM", "ARKK", "XLE", "XLF",
+    ]
+
+    bot = TradingBot(mega_universe=MEGA_UNIVERSE, top_n=30)
     bot.run()

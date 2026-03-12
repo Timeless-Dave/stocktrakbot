@@ -8,6 +8,7 @@ import yfinance as yf
 import pandas as pd
 import ta
 from datetime import datetime
+import concurrent.futures
 
 
 class MarketDataFetcher:
@@ -15,6 +16,29 @@ class MarketDataFetcher:
 
     def __init__(self) -> None:
         self.market_cache: dict = {}
+
+    # ─────────────────────────────────────────────────────────────────────────
+    def fetch_macro_context(self) -> dict:
+        """Fetch market-wide fear (VIX) and broader market trend (SPY 5d). Once per cycle."""
+        print("[Data] Fetching macro context (VIX & SPY)...")
+        try:
+            vix_tkr = yf.Ticker("^VIX")
+            vix_df = vix_tkr.history(period="5d")
+            current_vix = round(float(vix_df["Close"].iloc[-1]), 2) if not vix_df.empty else 20.0
+
+            spy_tkr = yf.Ticker("SPY")
+            spy_df = spy_tkr.history(period="5d")
+            if not spy_df.empty and len(spy_df) >= 2:
+                spy_start = float(spy_df["Close"].iloc[0])
+                spy_end   = float(spy_df["Close"].iloc[-1])
+                spy_trend = round(((spy_end - spy_start) / spy_start) * 100, 2)
+            else:
+                spy_trend = 0.0
+
+            return {"VIX": current_vix, "SPY_5D_Trend_Pct": spy_trend}
+        except Exception as exc:
+            print(f"[Data][Error] Macro fetch failed: {exc}")
+            return {"VIX": 20.0, "SPY_5D_Trend_Pct": 0.0}
 
     # ─────────────────────────────────────────────────────────────────────────
     def fetch_full_data(
@@ -74,6 +98,12 @@ class MarketDataFetcher:
                 v = s.iloc[-1]
                 return round(float(v) if not pd.isna(v) else 0.0, dec)
 
+            # Volume surge: % of 20-day average (e.g. 250 = 2.5x normal). Volume precedes price.
+            avg_vol = max(_last(vol_sma, 2), 1)
+            volume_surge_pct = round(
+                (float(volume.iloc[-1]) / avg_vol) * 100, 2
+            )
+
             entry: dict = {
                 "asset_class":    asset_class,
                 "last_updated":   datetime.now().isoformat(timespec="seconds"),
@@ -90,9 +120,10 @@ class MarketDataFetcher:
                 "atr_14":         _last(atr,         4),  # Average True Range
                 "volume":         int(volume.iloc[-1]),
                 "volume_vs_avg":  round(
-                    float(volume.iloc[-1]) / max(_last(vol_sma, 2), 1),
+                    float(volume.iloc[-1]) / avg_vol,
                     2,
                 ),
+                "volume_surge_pct": volume_surge_pct,  # e.g. 200 = 2x 20-day avg volume
                 "price_change_5d": round(
                     ((float(close.iloc[-1]) - float(close.iloc[-5]))
                      / float(close.iloc[-5]) * 100)
@@ -115,6 +146,63 @@ class MarketDataFetcher:
         except Exception as exc:
             print(f"[Data][Error] Failed to fetch {ticker}: {exc}")
             return None
+
+    # ─────────────────────────────────────────────────────────────────────────
+    @staticmethod
+    def _infer_asset_class(ticker: str) -> str:
+        """
+        Best-effort inference for mixed universes.
+        - Crypto: Yahoo symbols typically end with -USD
+        - ETFs: common all-caps symbols (ambiguous), caller can override by passing asset_class
+        """
+        t = (ticker or "").upper()
+        if t.endswith("-USD"):
+            return "crypto"
+        return "stocks"
+
+    def screen_universe(
+        self,
+        mega_universe: list[str],
+        top_n: int = 30,
+        max_workers: int = 10,
+    ) -> dict:
+        """
+        Two-stage pipeline pre-screener:
+        - Fetch data for a large universe in parallel
+        - Rank by volume_surge_pct (descending)
+        - Return only top N tickers for the model to analyze (saves tokens / cost)
+        """
+        total = len(mega_universe)
+        print(f"[Ingest] Rapid scanning {total} assets (parallel x{max_workers})...")
+        results: dict[str, dict] = {}
+
+        def _fetch_one(t: str) -> tuple[str, dict | None]:
+            cls = self._infer_asset_class(t)
+            return t, self.fetch_full_data(t, asset_class=cls)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futures = [ex.submit(_fetch_one, t) for t in mega_universe]
+            for fut in concurrent.futures.as_completed(futures):
+                try:
+                    ticker, data = fut.result()
+                    if data:
+                        results[ticker] = data
+                except Exception:
+                    continue
+
+        if not results:
+            print("[Ingest][Warning] Screener returned no usable data.")
+            return {}
+
+        ranked = sorted(
+            results.keys(),
+            key=lambda k: float(results[k].get("volume_surge_pct") or 0.0),
+            reverse=True,
+        )
+        top = ranked[: max(top_n, 1)]
+        filtered = {t: results[t] for t in top}
+        print(f"[Ingest] Filtered down to top {len(filtered)} active tickers for AI analysis.")
+        return filtered
 
     # ── Legacy alias ──────────────────────────────────────────────────────────
     def fetch_stock_data(self, ticker: str, period: str = "3mo",
