@@ -43,6 +43,11 @@ MAX_FETCH_RETRIES: int = 3
 HEADLESS: bool = True
 CRYPTO_ALWAYS_ON: bool = True        # crypto analysed even when market closed
 
+# Leaderboard guard: if your rank is <= this threshold, the bot pauses and
+# asks for manual y/n confirmation before placing any trades that cycle.
+# Set to 0 to disable the guard entirely.
+RANK_GUARD_THRESHOLD: int = 3
+
 # How long to sleep BETWEEN each ticker's API call (keeps us under ~15 RPM).
 # Math: 29 tickers × 6s = 174s/cycle ≈ 3 min.  4 cycles/hr = 116 calls/hr.
 # Over a 6.5-hr trading day ≈ 754 calls — well under the 1,500/day free-tier cap.
