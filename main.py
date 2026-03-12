@@ -25,6 +25,7 @@ from config import (
     MAX_FETCH_RETRIES,
     HEADLESS,
     CRYPTO_ALWAYS_ON,
+    RANK_GUARD_THRESHOLD,
     STOCKTRAK_USER,
     STOCKTRAK_PASS,
     validate_config,
@@ -129,7 +130,7 @@ class TradingBot:
         return self.eyes.screen_universe(universe, top_n=self.top_n, max_workers=10)
 
     # ─────────────────────────────────────────────────────────────────────────
-    def _execute_decisions(self, decisions: list) -> None:
+    def _execute_decisions(self, decisions: list, market_open: bool) -> None:
         """
         PHASE 3 — Order Execution Queue.
         Work through the model's ranked list and fire trades for high-confidence signals.
@@ -161,6 +162,12 @@ class TradingBot:
                 continue
 
             asset_class = class_map.get(ticker, "stocks")
+
+            # Market Hours Guard
+            if not market_open and asset_class != "crypto":
+                print(f"[{ts()}] [Skip]   Market closed — cannot trade {ticker} ({asset_class}).")
+                continue
+
             note = f"[{action}] {ticker} ({asset_class}) — {reasoning} (conf: {confidence}%)"
 
             ok = self.hands.execute_trade(
@@ -174,7 +181,46 @@ class TradingBot:
             if ok:
                 self.positions[ticker] = "long" if action == "BUY" else None
 
-    # ─────────────────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────────────
+    def _check_rank_guard(self) -> bool:
+        """
+        Check the leaderboard. If the current rank is within the guard threshold,
+        prompt the user for manual confirmation before trading.
+
+        Returns True  → safe to proceed with trades.
+        Returns False → user said no, skip execution this cycle.
+        """
+        if RANK_GUARD_THRESHOLD <= 0:
+            return True  # guard disabled
+
+        rank = self.hands.sync_rank()
+
+        if rank is None:
+            print(f"[{ts()}] [Rank] Could not determine ranking (page may have changed). Proceeding.")
+            return True
+
+        print(f"[{ts()}] [Rank] Current leaderboard position: #{rank}")
+
+        if rank <= RANK_GUARD_THRESHOLD:
+            print()
+            print("=" * 60)
+            print(f"  ⚠️  YOU ARE RANK #{rank} — TOP {RANK_GUARD_THRESHOLD} GUARD ACTIVE")
+            print("  The bot wants to execute trades this cycle.")
+            print("  Proceeding could move you out of this position.")
+            print("=" * 60)
+            try:
+                answer = input("  Allow trades this cycle? [y/N]: ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                answer = "n"
+            print()
+            if answer != "y":
+                print(f"[{ts()}] [Rank] Trade execution SKIPPED by user (rank guard).")
+                return False
+            print(f"[{ts()}] [Rank] User approved — proceeding with trades.")
+
+        return True
+
+    # ─────────────────────────────────────────────────────────────────────────────
     def run(self) -> None:
         print(f"[{ts()}] [System] Bot active.")
         try:
@@ -215,13 +261,25 @@ class TradingBot:
 
                 # PHASE 2: ONE batch OpenAI call (matrix + macro context)
                 owned = [t for t, pos in self.positions.items() if pos == "long"]
+                if not open_now:
+                    # Filter out non-crypto owned assets so AI doesn't try to sell them
+                    class_map = {t: cls for cls, tickers in WATCHLIST.items() for t in tickers}
+                    owned = [t for t in owned if class_map.get(t, "stocks") == "crypto" or t.endswith("-USD")]
+
                 decisions = self.brain.analyze_portfolio(matrix, macro, owned_assets=owned)
 
                 if not decisions:
                     print(f"[{ts()}] [Warning] No decisions returned from OpenAI.")
                 else:
-                    # PHASE 3: Execute trades
-                    self._execute_decisions(decisions)
+                    # PHASE 3: Execute trades — but ask first if we're in top N
+                    if self._check_rank_guard():
+                        self._execute_decisions(decisions, market_open=open_now)
+                    else:
+                        # Still print signals so user can see what was planned
+                        for d in decisions:
+                            if d.get("action") in ("BUY", "SELL"):
+                                print(f"[{ts()}] [Skipped] {d['action']} {d.get('ticker','')} "
+                                      f"(rank guard active, trade not placed)")
 
                 print("-" * 60)
                 print(f"[{ts()}] [System] Cycle done. Next in {CYCLE_SLEEP_SECONDS // 60} min.")
