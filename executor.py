@@ -461,9 +461,9 @@ class StockTrakExecutor:
             return None
 
         rank_urls = [
-            "https://app.stocktrak.com/account/rankings",
+            "https://app.stocktrak.com/account/ranking",   # confirmed correct URL
             "https://app.stocktrak.com/leaderboard",
-            "https://app.stocktrak.com/ranking",
+            "https://app.stocktrak.com/account/rankings",   # old/wrong — last resort
         ]
 
         # We need the username to match our own row
