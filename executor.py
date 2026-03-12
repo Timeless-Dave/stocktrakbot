@@ -41,9 +41,18 @@ class StockTrakExecutor:
     _SEL_NOTES       = "textarea#trade-notes"             # confirmed live 2026-03-10
     _SEL_PREVIEW     = "#btnPreviewOrder"
     _SEL_CONFIRM     = "#btnPlaceOrder"                   # confirmed live 2026-03-10
-    # Success banner after order is placed
-    _SEL_SUCCESS     = ".order-confirmation, text=Order Confirmation Number, text=was sent to the market"
-    _SEL_VIEW_POSITIONS_LINK = "text=View Positions"
+    # Success banner after order is placed.
+    # NOTE: wait_for_selector only accepts CSS/XPath — Playwright `text=` pseudo-selectors
+    # are locator-only and CANNOT be joined by comma here. Use ordered CSS-safe candidates.
+    _SEL_SUCCESS_CANDIDATES = [
+        ".order-confirmation",           # preferred: dedicated confirmation div
+        "#order-confirmation",           # alternative id form
+        ".alert-success",                # generic Bootstrap success alert
+    ]
+    # Text to look for as a last-resort string check if no selector matched
+    _SUCCESS_TEXTS = ["Order Confirmation Number", "was sent to the market", "order has been placed"]
+    # Direct URL to the open positions page (href from the nav dropdown anchor)
+    _POSITIONS_URL = "https://app.stocktrak.com/account/openpositions"
     _DEBUG_DIR = "debug_screenshots"
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -107,28 +116,46 @@ class StockTrakExecutor:
         owned: dict[str, str] = {}
 
         try:
-            # Prefer clicking the UI link (present on trading pages)
-            self._page.goto(self._DASHBOARD_URL, wait_until="domcontentloaded", timeout=30_000)
+            # Navigate directly to the open positions page (the menu item's href)
+            self._page.goto(self._POSITIONS_URL, wait_until="domcontentloaded", timeout=30_000)
             time.sleep(1.5)
             self._dismiss_overlays()
 
+            # Try to find position data — StockTrak may use a table OR a div-based layout
+            # Strategy 1: standard <table>
+            rows = None
             try:
-                self._page.locator(self._SEL_VIEW_POSITIONS_LINK).first.click(timeout=8_000)
-            except Exception:
-                # Fallback: attempt to click from current page if dashboard differs
-                self._page.locator(self._SEL_VIEW_POSITIONS_LINK).first.click(timeout=8_000)
+                self._page.wait_for_selector("table", timeout=8_000)
+                rows = self._page.locator("table tbody tr")
+                if rows.count() == 0:
+                    rows = self._page.locator("table tr")
+            except PlaywrightTimeoutError:
+                pass  # No table — try div-based rows below
 
-            # Wait for some table-like content to appear
-            self._page.wait_for_selector("table", timeout=15_000)
-            time.sleep(1.0)
+            # Strategy 2: div/li rows (some SPA dashboards use these)
+            if rows is None or rows.count() == 0:
+                for sel in [
+                    "[class*='position-row']",
+                    "[class*='holding']",
+                    "[class*='portfolio-row']",
+                    ".open-positions tr",
+                    "#openPositions tr",
+                ]:
+                    candidate = self._page.locator(sel)
+                    if candidate.count() > 0:
+                        rows = candidate
+                        break
 
-            rows = self._page.locator("table tbody tr")
-            if rows.count() == 0:
-                rows = self._page.locator("table tr")
+            if rows is None or rows.count() == 0:
+                print("[Executor] Synced positions: no position rows found (may be an empty portfolio).")
+                return {}
 
             n = rows.count()
             for i in range(n):
-                txt = (rows.nth(i).inner_text() or "").upper()
+                try:
+                    txt = (rows.nth(i).inner_text() or "").upper()
+                except Exception:
+                    continue
                 if not txt.strip():
                     continue
 
@@ -138,8 +165,6 @@ class StockTrakExecutor:
                         if t in txt:
                             owned[t] = "long"
                 else:
-                    # Heuristic fallback: look for common ticker tokens in the row.
-                    # (Kept conservative; better to pass known_tickers.)
                     tokens = [w.strip() for w in txt.replace("\n", " ").split(" ") if w.strip()]
                     for tok in tokens:
                         if 1 <= len(tok) <= 10 and tok.isascii() and any(c.isalpha() for c in tok):
@@ -149,7 +174,7 @@ class StockTrakExecutor:
             if owned:
                 print(f"[Executor] Synced positions: {len(owned)} open tickers detected.")
             else:
-                print("[Executor] Synced positions: none detected.")
+                print("[Executor] Synced positions: none detected (portfolio may be empty).")
             return owned
 
         except Exception as exc:
@@ -244,18 +269,11 @@ class StockTrakExecutor:
             time.sleep(2.5)
 
             # 5. Verify success
-            try:
-                self._page.wait_for_selector(self._SEL_SUCCESS, timeout=10_000)
-                print(f"[Executor] ✓ {action} CRYPTO order for {ticker} confirmed.")
+            if self._verify_success(ticker, action, label="CRYPTO"):
                 return True
-            except PlaywrightTimeoutError:
-                current_url = self._page.url
-                if "confirmation" in current_url or "orderhistory" in current_url:
-                    print(f"[Executor] ✓ {action} CRYPTO order likely confirmed (URL: {current_url}).")
-                    return True
-                self._debug_screenshot(f"crypto_timeout_{ticker}")
-                print("[Executor][Warning] Could not verify crypto success banner.")
-                return False
+            self._debug_screenshot(f"crypto_timeout_{ticker}")
+            print("[Executor][Warning] Could not verify crypto success banner.")
+            return False
 
         except PlaywrightTimeoutError as exc:
             print(f"[Executor][Error] Crypto UI timed out for {ticker}: {exc}")
@@ -331,19 +349,11 @@ class StockTrakExecutor:
             time.sleep(2.5)
 
             # ── 9. Verify success ─────────────────────────────────────────────
-            try:
-                self._page.wait_for_selector(self._SEL_SUCCESS, timeout=10_000)
-                print(f"[Executor] ✓ {action} order for {ticker} confirmed.")
+            if self._verify_success(ticker, action):
                 return True
-            except PlaywrightTimeoutError:
-                # Page may still have navigated successfully; check URL
-                current_url = self._page.url
-                if "confirmation" in current_url or "orderhistory" in current_url:
-                    print(f"[Executor] ✓ {action} order likely confirmed (URL: {current_url}).")
-                    return True
-                self._debug_screenshot(f"no_success_{ticker}")
-                print("[Executor][Warning] Could not verify success banner — order may still have gone through.")
-                return False  # Conservative: treat as failure so operator can inspect
+            self._debug_screenshot(f"no_success_{ticker}")
+            print("[Executor][Warning] Could not verify success banner — order may still have gone through.")
+            return False  # Conservative: treat as failure so operator can inspect
 
         except PlaywrightTimeoutError as exc:
             print(
@@ -360,26 +370,82 @@ class StockTrakExecutor:
     # ── Private helpers ────────────────────────────────────────────────────────
     def _select_autocomplete(self, ticker: str) -> bool:
         """
-        Try to click the first autocomplete result that matches ticker.
+        Try to click the autocomplete result that best matches ticker.
+        Matching priority:
+          1. Exact ticker symbol match (whole word, e.g. "GE" must not match "AGEN")
+          2. Ticker appears as the first token of the autocomplete item text
+          3. First result if nothing better found (last resort)
         Returns True if one was clicked, False otherwise.
         """
+        import re
+        ticker_up = ticker.upper()
         try:
             # Wait up to 3 s for at least one result to appear
             self._page.wait_for_selector(self._SEL_AUTOCMPLT, timeout=3_000)
-            # Prefer an exact ticker match first
             items = self._page.locator(self._SEL_AUTOCMPLT)
             count = items.count()
+            if count == 0:
+                return False
+
+            # Collect (index, text) pairs
+            candidates: list[tuple[int, str]] = []
             for i in range(count):
-                item = items.nth(i)
-                text = item.inner_text().upper()
-                if ticker.upper() in text:
-                    item.click(timeout=5_000)
+                try:
+                    candidates.append((i, items.nth(i).inner_text().upper().strip()))
+                except Exception:
+                    pass
+
+            # Priority 1: whole-word exact ticker match using word boundary regex
+            pattern = re.compile(r'\b' + re.escape(ticker_up) + r'\b')
+            for i, text in candidates:
+                if pattern.search(text):
+                    items.nth(i).click(timeout=5_000)
                     return True
-            # No exact match — click the very first result
-            if count > 0:
-                items.first.click(timeout=5_000)
-                return True
+
+            # Priority 2: ticker is first whitespace-delimited token
+            for i, text in candidates:
+                first_token = text.split()[0] if text.split() else ""
+                if first_token == ticker_up:
+                    items.nth(i).click(timeout=5_000)
+                    return True
+
+            # Priority 3: last resort — first result only (log a warning)
+            print(f"[Executor][Warning] No exact autocomplete match for {ticker}; "
+                  f"picking first result: '{candidates[0][1] if candidates else '?'}'")
+            items.first.click(timeout=5_000)
+            return True
         except PlaywrightTimeoutError:
+            pass
+        return False
+
+    def _verify_success(self, ticker: str, action: str, label: str = "") -> bool:
+        """
+        Check for an order-success indicator using multiple strategies:
+        1. Try each CSS selector candidate.
+        2. Fall back to a URL check.
+        3. Fall back to page-text keyword scan.
+        """
+        prefix = f"[Executor] ✓ {action}{' ' + label if label else ''} order for {ticker}"
+        # Strategy 1: CSS selector candidates
+        for sel in self._SEL_SUCCESS_CANDIDATES:
+            try:
+                self._page.wait_for_selector(sel, timeout=6_000)
+                print(f"{prefix} confirmed (selector: {sel}).")
+                return True
+            except PlaywrightTimeoutError:
+                continue
+        # Strategy 2: URL check
+        current_url = self._page.url
+        if any(kw in current_url for kw in ("confirmation", "orderhistory", "order-history")):
+            print(f"{prefix} likely confirmed (URL: {current_url}).")
+            return True
+        # Strategy 3: Page text keyword scan
+        try:
+            body_text = self._page.locator("body").inner_text(timeout=3_000)
+            if any(phrase.lower() in body_text.lower() for phrase in self._SUCCESS_TEXTS):
+                print(f"{prefix} confirmed (success text found in page).")
+                return True
+        except Exception:
             pass
         return False
 
