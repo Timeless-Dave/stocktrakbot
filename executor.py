@@ -103,84 +103,117 @@ class StockTrakExecutor:
     def sync_positions(self, known_tickers: list[str] | None = None) -> dict[str, str]:
         """
         Best-effort scrape of current positions from Stock-Trak UI.
-        Returns a dict like { "AAPL": "long", ... }.
+        Returns a dict like { "AAPL": "long", "BTC": "long", ... }.
 
-        This allows SELL decisions to be portfolio-aware even if positions were opened manually
-        or in a previous bot session.
+        Tries multiple URL strategies to navigate to the open-positions view,
+        since StockTrak sometimes uses tabs on the portfolio/account page.
         """
         if not self.logged_in:
             print("[Executor][Warning] Not logged in — cannot sync positions.")
             return {}
 
         known_upper = {t.upper() for t in (known_tickers or []) if t}
+        # Also index the base symbol for crypto (BTC-USD → BTC)
+        known_base = {
+            t.split("-")[0].upper() if "-" in t else t.upper()
+            for t in (known_tickers or []) if t
+        }
         owned: dict[str, str] = {}
 
-        try:
-            # Navigate directly to the open positions page (the menu item's href)
-            self._page.goto(self._POSITIONS_URL, wait_until="domcontentloaded", timeout=30_000)
-            time.sleep(1.5)
-            self._dismiss_overlays()
+        # URLs/strategies to try in order
+        candidate_urls = [
+            self._POSITIONS_URL,                                   # direct link
+            "https://app.stocktrak.com/portfolio/positions",       # alternate path
+            "https://app.stocktrak.com/account/portfolio",         # alternate path
+        ]
 
-            # Try to find position data — StockTrak may use a table OR a div-based layout
-            # Strategy 1: standard <table>
-            rows = None
+        rows = None
+        for url in candidate_urls:
             try:
-                self._page.wait_for_selector("table", timeout=8_000)
-                rows = self._page.locator("table tbody tr")
-                if rows.count() == 0:
-                    rows = self._page.locator("table tr")
-            except PlaywrightTimeoutError:
-                pass  # No table — try div-based rows below
+                self._page.goto(url, wait_until="domcontentloaded", timeout=25_000)
+                time.sleep(1.5)
+                self._dismiss_overlays()
 
-            # Strategy 2: div/li rows (some SPA dashboards use these)
-            if rows is None or rows.count() == 0:
+                # Some pages have an "Open Positions" tab — try clicking it
+                for tab_text in ["Open Positions", "Positions", "Portfolio"]:
+                    try:
+                        tab = self._page.locator(f"a:has-text('{tab_text}'), "
+                                                  f"button:has-text('{tab_text}'), "
+                                                  f"li:has-text('{tab_text}')").first
+                        tab.wait_for(state="visible", timeout=2_000)
+                        tab.click(timeout=3_000)
+                        time.sleep(1.0)
+                        break
+                    except Exception:
+                        pass
+
+                # Strategy A: standard <table>
+                try:
+                    self._page.wait_for_selector("table", timeout=6_000)
+                    candidate = self._page.locator("table tbody tr")
+                    if candidate.count() == 0:
+                        candidate = self._page.locator("table tr")
+                    if candidate.count() > 0:
+                        rows = candidate
+                        break
+                except PlaywrightTimeoutError:
+                    pass
+
+                # Strategy B: div/li-based rows
                 for sel in [
                     "[class*='position-row']",
                     "[class*='holding']",
                     "[class*='portfolio-row']",
                     ".open-positions tr",
                     "#openPositions tr",
+                    "[class*='OpenPosition'] tr",
                 ]:
                     candidate = self._page.locator(sel)
                     if candidate.count() > 0:
                         rows = candidate
                         break
+                if rows is not None and rows.count() > 0:
+                    break
 
-            if rows is None or rows.count() == 0:
-                print("[Executor] Synced positions: no position rows found (may be an empty portfolio).")
-                return {}
+            except Exception:
+                continue  # try next URL
 
-            n = rows.count()
-            for i in range(n):
-                try:
-                    txt = (rows.nth(i).inner_text() or "").upper()
-                except Exception:
-                    continue
-                if not txt.strip():
-                    continue
-
-                # If we have a known universe, only accept those tickers.
-                if known_upper:
-                    for t in known_upper:
-                        if t in txt:
-                            owned[t] = "long"
-                else:
-                    tokens = [w.strip() for w in txt.replace("\n", " ").split(" ") if w.strip()]
-                    for tok in tokens:
-                        if 1 <= len(tok) <= 10 and tok.isascii() and any(c.isalpha() for c in tok):
-                            if tok.endswith("-USD") or (tok.isalpha() and tok.isupper() and 1 <= len(tok) <= 5):
-                                owned[tok] = "long"
-
-            if owned:
-                print(f"[Executor] Synced positions: {len(owned)} open tickers detected.")
-            else:
-                print("[Executor] Synced positions: none detected (portfolio may be empty).")
-            return owned
-
-        except Exception as exc:
-            print(f"[Executor][Warning] Position sync failed: {exc}")
-            self._debug_screenshot("positions_sync_failed")
+        if rows is None or rows.count() == 0:
+            print("[Executor] Synced positions: no position rows found (may be an empty portfolio).")
+            self._debug_screenshot("positions_sync_empty")
             return {}
+
+        n = rows.count()
+        for i in range(n):
+            try:
+                txt = (rows.nth(i).inner_text() or "").upper()
+            except Exception:
+                continue
+            if not txt.strip():
+                continue
+
+            if known_upper:
+                for t in known_upper:
+                    if t in txt:
+                        owned[t] = "long"
+                # Also match base symbols (e.g. BTC in "BTC BITCOIN")
+                for base in known_base:
+                    if base in txt:
+                        # Map back to full ticker if possible
+                        full = next((t for t in known_upper if t.startswith(base)), base)
+                        owned[full] = "long"
+            else:
+                tokens = [w.strip() for w in txt.replace("\n", " ").split(" ") if w.strip()]
+                for tok in tokens:
+                    if 1 <= len(tok) <= 10 and tok.isascii() and any(c.isalpha() for c in tok):
+                        if tok.endswith("-USD") or (tok.isalpha() and tok.isupper() and 1 <= len(tok) <= 5):
+                            owned[tok] = "long"
+
+        if owned:
+            print(f"[Executor] Synced positions: {len(owned)} open tickers detected.")
+        else:
+            print("[Executor] Synced positions: none detected (portfolio may be empty).")
+        return owned
 
     # ─────────────────────────────────────────────────────────────────────────
     def execute_trade(
@@ -194,6 +227,9 @@ class StockTrakExecutor:
         """
         Route to the correct trading page based on asset_class, then execute.
 
+        NOTE: /trading/cryptocurrency returned HTTP 404 as of 2026-03.
+        Crypto is now traded via the equities page using the base symbol (BTC, ETH, etc.).
+
         Parameters
         ----------
         ticker       : Symbol, e.g. "PLTR", "BTC-USD", "VFIAX"
@@ -204,9 +240,12 @@ class StockTrakExecutor:
         """
         if asset_class == "mutual":
             return self._execute_mutual_fund(ticker, action, quantity, notes)
+        # Crypto now uses the same equities page (/trading/equities).
+        # /trading/cryptocurrency returns a 404 on StockTrak as of 2026-03.
+        # We pass the base symbol (e.g. 'BTC' from 'BTC-USD') to the equities form.
         if asset_class == "crypto":
-            # Crypto uses the dedicated Trade Cryptos UI; route via crypto flow.
-            return self._execute_crypto(ticker, action, quantity, notes)
+            base = ticker.split("-")[0] if "-" in ticker else ticker
+            return self._execute_equities(base, action, quantity, notes)
         # stocks, ETFs, bonds all use the equities trading page
         return self._execute_equities(ticker, action, quantity, notes)
 
@@ -292,7 +331,30 @@ class StockTrakExecutor:
             return False
 
         action = action.upper()
+        # For crypto tickers like BTC-USD, we already strip to base (BTC) upstream
         print(f"[Executor] {action} × {quantity} of {ticker} via equities page…")
+
+        # Error phrases that block order progression — checked at multiple points
+        _ERROR_PHRASES = [
+            "requires an existing long position",
+            "cancel pending orders",
+            "you do not have sufficient",
+            "order cannot be placed",
+            "cannot place a sell order",
+            "no shares to sell",
+            "short selling is not allowed",
+        ]
+
+        def _page_has_error() -> str | None:
+            """Scan page body for known error phrases. Returns matched phrase or None."""
+            try:
+                txt = self._page.locator("body").inner_text(timeout=2_000).lower()
+                for phrase in _ERROR_PHRASES:
+                    if phrase in txt:
+                        return phrase
+            except Exception:
+                pass
+            return None
 
         try:
             # ── 1. Navigate to trading page ───────────────────────────────────
@@ -301,6 +363,13 @@ class StockTrakExecutor:
 
             # Dismiss any cookie banner / tour modal that may block clicks
             self._dismiss_overlays()
+
+            # ── Guard: check for page-level errors immediately after load ─────
+            err = _page_has_error()
+            if err:
+                print(f"[Executor][Warning] Trade page error for {ticker} before form fill: '{err}'.")
+                self._debug_screenshot(f"blocked_early_{ticker}_{action}")
+                return False
 
             # ── 2. Enter Ticker symbol ────────────────────────────────────────
             symbol_box = self._page.locator(self._SEL_SYMBOL)
@@ -318,11 +387,18 @@ class StockTrakExecutor:
             time.sleep(1.2)   # Let price widget populate
 
             # ── 3. Select Buy / Sell via label toggle buttons ─────────────────
-            # StockTrak uses <label> buttons, not a <select> element
             label_text = "Buy" if action == "BUY" else "Sell"
-            action_label = self._page.locator(f"label.button", has_text=label_text).first
+            action_label = self._page.locator("label.button", has_text=label_text).first
             action_label.click(timeout=8_000)
-            time.sleep(0.5)
+            time.sleep(0.8)
+
+            # ── Guard: check for errors after action selection ────────────────
+            # e.g. "requires an existing long position" appears as soon as Sell is clicked
+            err = _page_has_error()
+            if err:
+                print(f"[Executor][Warning] Order blocked for {ticker} after action select: '{err}'.")
+                self._debug_screenshot(f"blocked_{ticker}_{action}")
+                return False
 
             # ── 4. Enter Quantity ─────────────────────────────────────────────
             qty_box = self._page.locator(self._SEL_QUANTITY)
@@ -330,7 +406,7 @@ class StockTrakExecutor:
             qty_box.fill(str(quantity), timeout=5_000)
             time.sleep(0.5)
 
-            # ── 5. Fill Trading Notes (required by some classes) ──────────────
+            # ── 5. Fill Trading Notes (may appear on order form page) ─────────
             note_text = notes or self._auto_note(ticker, action)
             self._fill_notes(note_text)
 
@@ -338,8 +414,14 @@ class StockTrakExecutor:
             self._page.locator(self._SEL_PREVIEW).click(timeout=8_000)
             time.sleep(2.0)  # Review / confirmation page loads
 
+            # ── 6b. Fail fast on error banners on the review page ─────────────
+            err = _page_has_error()
+            if err:
+                print(f"[Executor][Warning] Order blocked for {ticker} on review page: '{err}'.")
+                self._debug_screenshot(f"blocked_review_{ticker}_{action}")
+                return False
+
             # ── 7. Fill trading notes on the review page ──────────────────────
-            # The notes field (textarea#trade-notes) only exists on the review page
             self._fill_notes(note_text)
 
             # ── 8. Confirm the order ──────────────────────────────────────────
@@ -353,7 +435,7 @@ class StockTrakExecutor:
                 return True
             self._debug_screenshot(f"no_success_{ticker}")
             print("[Executor][Warning] Could not verify success banner — order may still have gone through.")
-            return False  # Conservative: treat as failure so operator can inspect
+            return False
 
         except PlaywrightTimeoutError as exc:
             print(
@@ -366,6 +448,101 @@ class StockTrakExecutor:
             print(f"[Executor][Error] Unexpected error trading {ticker}: {exc}")
             self._debug_screenshot(f"error_{ticker}_{action}")
             return False
+
+    # ─────────────────────────────────────────────────────────────────────────
+    def sync_rank(self) -> int | None:
+        """
+        Scrape the current portfolio ranking from the StockTrak leaderboard.
+        Returns the integer rank (1 = first place) or None if it cannot be determined.
+
+        Tries multiple strategies:
+          1. Highlighted / special-class table row
+          2. CSS-class scan on every row
+          3. Username text match across every row
+          4. "Your rank" / summary text anywhere on page
+        """
+        if not self.logged_in:
+            return None
+
+        rank_urls = [
+            "https://app.stocktrak.com/account/rankings",
+            "https://app.stocktrak.com/leaderboard",
+            "https://app.stocktrak.com/ranking",
+        ]
+
+        # We need the username to match our own row
+        from config import STOCKTRAK_USER
+        own_user = (STOCKTRAK_USER or "").lower()
+
+        for url in rank_urls:
+            try:
+                self._page.goto(url, wait_until="domcontentloaded", timeout=20_000)
+                time.sleep(1.5)
+                self._dismiss_overlays()
+
+                # ── Strategy 1: highlighted row by CSS class ──────────────────
+                for sel in ["tr.active", "tr.current-user", "tr.myrow",
+                            "tr.highlight", "tr.me", "tr.own"]:
+                    try:
+                        row = self._page.locator(sel).first
+                        row.wait_for(state="visible", timeout=2_000)
+                        txt = row.inner_text()
+                        rank_str = txt.strip().split()[0].replace("#", "").replace(".", "")
+                        if rank_str.isdigit():
+                            print(f"[Executor] Rank detected via highlighted row: #{rank_str}")
+                            return int(rank_str)
+                    except Exception:
+                        continue
+
+                # ── Strategy 2: scan all rows — class attr OR username match ──
+                rows = self._page.locator("table tbody tr")
+                n = rows.count()
+                for i in range(n):
+                    try:
+                        row_el = rows.nth(i)
+                        cls = (row_el.get_attribute("class") or "").lower()
+                        row_text = row_el.inner_text().lower()
+                        cells = row_el.locator("td")
+                        if cells.count() < 1:
+                            continue
+                        rank_cell = cells.nth(0).inner_text().strip().replace("#", "").replace(".", "")
+                        if not rank_cell.isdigit():
+                            continue
+                        # Match by highlighted class
+                        if any(k in cls for k in ("active", "current", "highlight", "myrow", "self", "me", "own")):
+                            print(f"[Executor] Rank detected via row class: #{rank_cell}")
+                            return int(rank_cell)
+                        # Match by username text
+                        if own_user and own_user in row_text:
+                            print(f"[Executor] Rank detected via username match: #{rank_cell}")
+                            return int(rank_cell)
+                    except Exception:
+                        continue
+
+                # ── Strategy 3: free-text search for "rank" / "position" ──────
+                try:
+                    import re
+                    body = self._page.locator("body").inner_text(timeout=3_000)
+                    # Look for patterns like "Rank: 2", "#2", "Your rank is 2", "Place: 2"
+                    for pattern in [
+                        r"(?:your\s+)?rank(?:\s+is)?[:\s#]+([0-9]+)",
+                        r"(?:place|position)[:\s#]+([0-9]+)",
+                        r"#([0-9]+)\s+(?:of|out\s+of)",
+                    ]:
+                        m = re.search(pattern, body.lower())
+                        if m:
+                            rank_val = int(m.group(1))
+                            print(f"[Executor] Rank detected via page text pattern: #{rank_val}")
+                            return rank_val
+                except Exception:
+                    pass
+
+            except Exception:
+                continue  # try next URL
+
+        self._debug_screenshot("rank_sync_failed")
+        print("[Executor][Debug] Could not determine rank from any rankings page.")
+        return None
 
     # ── Private helpers ────────────────────────────────────────────────────────
     def _select_autocomplete(self, ticker: str) -> bool:
