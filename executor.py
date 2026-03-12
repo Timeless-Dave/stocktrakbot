@@ -26,7 +26,7 @@ class StockTrakExecutor:
 
     # Trading pages
     _TRADING_URL     = "https://app.stocktrak.com/trading/equities"
-    _CRYPTO_URL      = "https://app.stocktrak.com/trading/cryptocurrency"
+    _CRYPTO_URL      = "https://app.stocktrak.com/trading/crypto"
 
     # Trading form fields
     _SEL_SYMBOL      = "#tbSymbol"
@@ -227,9 +227,6 @@ class StockTrakExecutor:
         """
         Route to the correct trading page based on asset_class, then execute.
 
-        NOTE: /trading/cryptocurrency returned HTTP 404 as of 2026-03.
-        Crypto is now traded via the equities page using the base symbol (BTC, ETH, etc.).
-
         Parameters
         ----------
         ticker       : Symbol, e.g. "PLTR", "BTC-USD", "VFIAX"
@@ -240,12 +237,9 @@ class StockTrakExecutor:
         """
         if asset_class == "mutual":
             return self._execute_mutual_fund(ticker, action, quantity, notes)
-        # Crypto now uses the same equities page (/trading/equities).
-        # /trading/cryptocurrency returns a 404 on StockTrak as of 2026-03.
-        # We pass the base symbol (e.g. 'BTC' from 'BTC-USD') to the equities form.
+        # Crypto uses its own dedicated page: /trading/crypto
         if asset_class == "crypto":
-            base = ticker.split("-")[0] if "-" in ticker else ticker
-            return self._execute_equities(base, action, quantity, notes)
+            return self._execute_crypto(ticker, action, quantity, notes)
         # stocks, ETFs, bonds all use the equities trading page
         return self._execute_equities(ticker, action, quantity, notes)
 
@@ -259,8 +253,10 @@ class StockTrakExecutor:
     def _execute_crypto(self, ticker: str, action: str,
                         quantity: int, notes: str = "") -> bool:
         """
-        Dedicated crypto execution engine.
-        Uses #tbSymbol, #tbQuantity; Buy/Sell via label.button; #btnPreviewOrder, #btnPlaceOrder.
+        Dedicated crypto execution engine — uses https://app.stocktrak.com/trading/crypto.
+        Shares the same form selectors as equities:
+        #tbSymbol, #tbQuantity, label.button, #btnPreviewOrder, #btnPlaceOrder.
+        The base symbol is used for search (e.g. 'BTC' from 'BTC-USD').
         """
         if not self.logged_in:
             print("[Executor][Warning] Not logged in — skipping crypto trade.")
