@@ -8,6 +8,7 @@ import yfinance as yf
 import pandas as pd
 import ta
 from datetime import datetime
+import pytz
 import concurrent.futures
 
 
@@ -98,11 +99,21 @@ class MarketDataFetcher:
                 v = s.iloc[-1]
                 return round(float(v) if not pd.isna(v) else 0.0, dec)
 
-            # Volume surge: % of 20-day average (e.g. 250 = 2.5x normal). Volume precedes price.
+            # Volume surge: project full-day volume using intraday run-rate, then compare to 20d avg.
             avg_vol = max(_last(vol_sma, 2), 1)
+            current_vol = float(volume.iloc[-1])
+
+            # Intraday volume extrapolation to full 390-minute session
+            tz = pytz.timezone("US/Eastern")
+            now = datetime.now(tz)
+            market_open = now.replace(hour=9, minute=30, second=0, microsecond=0)
+            minutes_open = (now - market_open).total_seconds() / 60.0
+            minutes_open = max(1.0, min(minutes_open, 390.0))
+            projected_volume = current_vol * (390.0 / minutes_open)
+
             volume_surge_pct = round(
-                (float(volume.iloc[-1]) / avg_vol) * 100, 2
-            )
+                (projected_volume / avg_vol) * 100, 2
+            ) if avg_vol > 0 else 0.0
 
             entry: dict = {
                 "asset_class":    asset_class,
@@ -118,9 +129,9 @@ class MarketDataFetcher:
                 "bb_upper":       _last(bb_upper,    2),
                 "bb_pct":         _last(bb_pct,      3),  # 0=lower band, 1=upper band
                 "atr_14":         _last(atr,         4),  # Average True Range
-                "volume":         int(volume.iloc[-1]),
+                "volume":         int(current_vol),
                 "volume_vs_avg":  round(
-                    float(volume.iloc[-1]) / avg_vol,
+                    current_vol / avg_vol,
                     2,
                 ),
                 "volume_surge_pct": volume_surge_pct,  # e.g. 200 = 2x 20-day avg volume

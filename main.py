@@ -67,6 +67,11 @@ class TradingBot:
 
         # Track open positions to avoid doubling in / naked shorts
         self.positions: dict[str, str | None] = {}
+        # Seed positions from Stock-Trak so SELL decisions are valid even if the bot didn't open them
+        known = self.mega_universe or [t for cls, tickers in WATCHLIST.items() for t in tickers]
+        seeded = self.hands.sync_positions(known_tickers=known)
+        for t, side in seeded.items():
+            self.positions[t] = side
 
         total = len(self.mega_universe) if self.mega_universe else sum(len(v) for v in WATCHLIST.values())
         print(f"[{ts()}] [System] Online. {total} assets | 1 OpenAI call/cycle")
@@ -191,6 +196,12 @@ class TradingBot:
                 macro = self.eyes.fetch_macro_context()
                 print(f"[{ts()}] [Macro] VIX: {macro['VIX']} | SPY 5D: {macro['SPY_5D_Trend_Pct']}%")
 
+                # Refresh positions each cycle (prevents naked sells if you trade manually)
+                known = self.mega_universe or [t for cls, tickers in WATCHLIST.items() for t in tickers]
+                seeded = self.hands.sync_positions(known_tickers=known)
+                for t, side in seeded.items():
+                    self.positions[t] = side
+
                 # PHASE 1: Ingest all data (no OpenAI calls)
                 if self.mega_universe:
                     matrix = self._ingest_screened(market_open=open_now)
@@ -231,7 +242,7 @@ if __name__ == "__main__":
         "AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META", "TSLA", "TSM", "AVGO", "AMD",
         # Momentum & High Volatility
         "PLTR", "MCD", "JNJ", "PEP", "NOW", "INTU", "GE", "NFLX", "UBER", "CRWD",
-        "SNOW", "PANW", "SMCI", "COIN", "HOOD", "RBLX", "SHOP", "SPOT", "SQ", "ARM",
+        "SNOW", "PANW", "SMCI", "COIN", "HOOD", "RBLX", "SHOP", "SPOT", "ARM",
         # Cryptos
         "BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD", "ADA-USD",
         # ETFs for broad exposure

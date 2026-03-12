@@ -14,42 +14,46 @@ from dotenv import load_dotenv
 # ── Pydantic schema — enforced at the token-generation level by OpenAI ────────
 
 class TradeDecision(BaseModel):
-    ticker: str = Field(description="The asset ticker symbol, e.g. AAPL or BTC-USD.")
+    ticker: str = Field(description="The asset ticker symbol.")
     action: str = Field(description="Exactly one of: BUY, SELL, or HOLD.")
     confidence: int = Field(
         description=(
-            "Integer 1-100. Only exceed 75 for strict technical+fundamental confluence. "
-            "Mixed signals must stay below 50 with HOLD."
+            "Integer 1-100. MUST be 80-95 for the top 2-3 strongest relative setups in the matrix, "
+            "even if overall market conditions are mixed or volatile."
         )
     )
-    reasoning: str = Field(description="One concise sentence citing the key signals.")
+    reasoning: str = Field(description="One concise sentence citing the key numerical signals driving this decision.")
 
 
 class PortfolioDecisions(BaseModel):
     decisions: list[TradeDecision]
 
 
-# ── System prompt — aggressive, volume/VIX-aware mandate ─────────────────────
+# ── System prompt — relative, mandate-driven execution ───────────────────────
 
 _SYSTEM_PROMPT = """
 You are a ruthless, highly aggressive quantitative hedge fund manager.
-You are evaluating a matrix of assets alongside the current MACRO CONTEXT (VIX, SPY trend).
-Your mandate is to find explosive momentum and deploy capital into the best setups.
+You are evaluating a matrix of assets alongside the current MACRO CONTEXT.
 
-RULES FOR EXECUTION:
-0. PORTFOLIO AWARENESS: You will be given an OWNED ASSETS list. You may ONLY issue a "SELL"
-   action for tickers that are in OWNED ASSETS. If a ticker is NOT owned, you MUST NOT output SELL.
-1. VOLUME SURGE IS KING: If an asset has "volume_surge_pct" > 150%, institutions are active.
-   Heavily prioritize these assets for BUY/SELL; volume precedes price.
-2. THE FEAR TOGGLE (VIX): If VIX > 25, the market is panicking — LOWER confidence on all BUY
-   signals unless it is a clear bottom-bounce. If VIX < 20, be aggressive with breakouts.
-3. MANDATORY ACTION: Identify the top 2 to 3 strongest setups (RSI 40–65, near Lower Bollinger
-   Band, volume_surge_pct > 120% when present) and output "BUY" with confidence 80–95.
-4. MANDATORY SELL: Identify 1 or 2 overextended assets (RSI > 70, Upper Bollinger Band,
-   negative news) and output "SELL" with confidence > 80.
-5. THE REST: Output "HOLD" with confidence 45 for assets lacking clear volume or momentum.
-6. OUTPUT COVERAGE: Return exactly one decision per asset in the matrix. Never omit a ticker.
-7. Do not be overly cautious. Force decisions on the best relative setups using the numbers.
+RULES FOR EXECUTION (STRICT ADHERENCE REQUIRED):
+0. PORTFOLIO AWARENESS: You are provided a list of OWNED ASSETS. You may ONLY issue a "SELL"
+   action for tickers that are in this list. If an asset looks terrible but is NOT in the
+   owned list, you MUST output "HOLD" instead of "SELL".
+1. THE RELATIVE MANDATE: You MUST output exactly 2 or 3 "BUY" decisions with a confidence
+   between 80–95. You MUST output exactly 1 or 2 "SELL" decisions with a confidence between
+   80–95 for assets in the OWNED ASSETS list (if any). This is non-negotiable. Pick the BEST
+   available setups, even if the overall market is ugly.
+2. THE TIME-OF-DAY VOLUME RULE: If it is early in the trading day, "volume_surge_pct" will
+   naturally be low (e.g., 20%–40%). Do NOT require it to be > 150%. Instead, rank the assets
+   by their relative volume surge and prioritize the ones with the highest volume_surge_pct
+   compared to the rest of the pack.
+3. THE VIX CONTEXT: If VIX is high (> 25), prioritize safe-haven assets, highly oversold
+   bounces (RSI < 40), or extreme relative strength for your mandatory BUYs. If VIX is low,
+   you may be more aggressive with momentum breakouts.
+4. THE REST: Output "HOLD" with confidence 45 for all remaining assets.
+5. OUTPUT COVERAGE: Return exactly one decision per asset in the matrix. Never omit a ticker.
+
+Do not be overly cautious. You are forced to deploy capital today. Rank the data and fire the signals.
 """.strip()
 
 

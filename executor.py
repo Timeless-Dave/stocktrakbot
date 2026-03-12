@@ -5,6 +5,7 @@ Stock-Trak: log in once, then execute BUY/SELL orders on demand.
 
 Selectors verified live against https://app.stocktrak.com on 2026-03-10.
 """
+import os
 import time
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
@@ -42,6 +43,8 @@ class StockTrakExecutor:
     _SEL_CONFIRM     = "#btnPlaceOrder"                   # confirmed live 2026-03-10
     # Success banner after order is placed
     _SEL_SUCCESS     = ".order-confirmation, text=Order Confirmation Number, text=was sent to the market"
+    _SEL_VIEW_POSITIONS_LINK = "text=View Positions"
+    _DEBUG_DIR = "debug_screenshots"
 
     # ─────────────────────────────────────────────────────────────────────────
     def __init__(self, headless: bool = True) -> None:
@@ -88,6 +91,73 @@ class StockTrakExecutor:
             return False
 
     # ─────────────────────────────────────────────────────────────────────────
+    def sync_positions(self, known_tickers: list[str] | None = None) -> dict[str, str]:
+        """
+        Best-effort scrape of current positions from Stock-Trak UI.
+        Returns a dict like { "AAPL": "long", ... }.
+
+        This allows SELL decisions to be portfolio-aware even if positions were opened manually
+        or in a previous bot session.
+        """
+        if not self.logged_in:
+            print("[Executor][Warning] Not logged in — cannot sync positions.")
+            return {}
+
+        known_upper = {t.upper() for t in (known_tickers or []) if t}
+        owned: dict[str, str] = {}
+
+        try:
+            # Prefer clicking the UI link (present on trading pages)
+            self._page.goto(self._DASHBOARD_URL, wait_until="domcontentloaded", timeout=30_000)
+            time.sleep(1.5)
+            self._dismiss_overlays()
+
+            try:
+                self._page.locator(self._SEL_VIEW_POSITIONS_LINK).first.click(timeout=8_000)
+            except Exception:
+                # Fallback: attempt to click from current page if dashboard differs
+                self._page.locator(self._SEL_VIEW_POSITIONS_LINK).first.click(timeout=8_000)
+
+            # Wait for some table-like content to appear
+            self._page.wait_for_selector("table", timeout=15_000)
+            time.sleep(1.0)
+
+            rows = self._page.locator("table tbody tr")
+            if rows.count() == 0:
+                rows = self._page.locator("table tr")
+
+            n = rows.count()
+            for i in range(n):
+                txt = (rows.nth(i).inner_text() or "").upper()
+                if not txt.strip():
+                    continue
+
+                # If we have a known universe, only accept those tickers.
+                if known_upper:
+                    for t in known_upper:
+                        if t in txt:
+                            owned[t] = "long"
+                else:
+                    # Heuristic fallback: look for common ticker tokens in the row.
+                    # (Kept conservative; better to pass known_tickers.)
+                    tokens = [w.strip() for w in txt.replace("\n", " ").split(" ") if w.strip()]
+                    for tok in tokens:
+                        if 1 <= len(tok) <= 10 and tok.isascii() and any(c.isalpha() for c in tok):
+                            if tok.endswith("-USD") or (tok.isalpha() and tok.isupper() and 1 <= len(tok) <= 5):
+                                owned[tok] = "long"
+
+            if owned:
+                print(f"[Executor] Synced positions: {len(owned)} open tickers detected.")
+            else:
+                print("[Executor] Synced positions: none detected.")
+            return owned
+
+        except Exception as exc:
+            print(f"[Executor][Warning] Position sync failed: {exc}")
+            self._debug_screenshot("positions_sync_failed")
+            return {}
+
+    # ─────────────────────────────────────────────────────────────────────────
     def execute_trade(
         self,
         ticker: str,
@@ -110,9 +180,9 @@ class StockTrakExecutor:
         if asset_class == "mutual":
             return self._execute_mutual_fund(ticker, action, quantity, notes)
         if asset_class == "crypto":
+            # Crypto uses the dedicated Trade Cryptos UI; route via crypto flow.
             return self._execute_crypto(ticker, action, quantity, notes)
-        # stocks, ETFs, crypto, bonds all previously used the equities trading page;
-        # now equities/ETFs/bonds continue to use that flow, while crypto is routed separately.
+        # stocks, ETFs, bonds all use the equities trading page
         return self._execute_equities(ticker, action, quantity, notes)
 
     def _execute_mutual_fund(self, ticker: str, action: str,
@@ -137,17 +207,22 @@ class StockTrakExecutor:
 
         try:
             self._page.goto(self._CRYPTO_URL, wait_until="domcontentloaded", timeout=30_000)
+            # Wait until the Trade Cryptos form is fully wired
+            self._page.wait_for_selector(self._SEL_SYMBOL, timeout=15_000)
             time.sleep(1.5)
             self._dismiss_overlays()
 
-            # 1. Symbol — wait for ui-autocomplete dropdown after typing
+            # 1. Symbol — for crypto, search base (e.g. BTC) instead of BTC-USD
+            base_symbol = ticker.split("-")[0] if "-" in ticker else ticker
             symbol_box = self._page.locator(self._SEL_SYMBOL)
             symbol_box.click(timeout=5_000)
             symbol_box.fill("", timeout=5_000)
-            symbol_box.type(ticker, delay=80)
-            time.sleep(1)   # Let ui-autocomplete-input dropdown appear
-            self._page.keyboard.press("Enter")
-            time.sleep(2)    # Let live quote load
+            symbol_box.type(base_symbol, delay=80)
+            time.sleep(1.5)   # Let ui-autocomplete-input dropdown appear
+            # Prefer clicking an autocomplete result if present; else press Enter.
+            if not self._select_autocomplete(base_symbol):
+                self._page.keyboard.press("Enter")
+            time.sleep(2.5)    # Let live quote / form populate
 
             # 2. Buy/Sell — radio labels: "Buy" / "Sell" (same pattern as equities)
             label_text = "Buy" if action == "BUY" else "Sell"
@@ -352,7 +427,10 @@ class StockTrakExecutor:
     def _debug_screenshot(self, name: str) -> None:
         """Save a screenshot to help diagnose selector problems."""
         try:
-            path = f"debug_{name}.png"
+            os.makedirs(self._DEBUG_DIR, exist_ok=True)
+            safe = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in name)
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            path = os.path.join(self._DEBUG_DIR, f"{ts}__{safe}.png")
             self._page.screenshot(path=path)
             print(f"[Executor][Debug] Screenshot saved → {path}")
         except Exception:
