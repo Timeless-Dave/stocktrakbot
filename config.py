@@ -36,7 +36,7 @@ WATCHLIST: dict[str, list[str]] = {
 TARGET_TICKERS: list[str] = [t for tickers in WATCHLIST.values() for t in tickers]
 
 # ── Bot Behaviour ─────────────────────────────────────────────────────────────
-TRADE_AMOUNT_DOLLARS: int = 5000
+TRADE_QUANTITY: int = 15
 CONFIDENCE_THRESHOLD: int = 75
 CYCLE_SLEEP_SECONDS: int = 900       # 15 min between cycles
 MAX_FETCH_RETRIES: int = 3

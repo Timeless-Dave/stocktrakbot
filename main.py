@@ -19,7 +19,7 @@ if hasattr(sys.stdout, "reconfigure"):
 
 from config import (
     WATCHLIST,
-    TRADE_AMOUNT_DOLLARS,
+    TRADE_QUANTITY,
     CONFIDENCE_THRESHOLD,
     CYCLE_SLEEP_SECONDS,
     MAX_FETCH_RETRIES,
@@ -170,18 +170,10 @@ class TradingBot:
 
             note = f"[{action}] {ticker} ({asset_class}) — {reasoning} (conf: {confidence}%)"
 
-            # Dynamic quantity sizing based on a target dollar amount per trade
-            price = matrix.get(ticker, {}).get("Last_Price", 0)
-            if price > 0:
-                if asset_class == "crypto":
-                    # Fractional shares up to 4 decimal places
-                    qty = round(TRADE_AMOUNT_DOLLARS / price, 4)
-                else:
-                    # Integer shares for equities
-                    qty = max(1, int(TRADE_AMOUNT_DOLLARS / price))
-            else:
-                # Fallback if price is somehow unavailable
-                qty = 15 if asset_class != "crypto" else 0.1
+            # Quantity: use the fixed config value for everything except Bitcoin.
+            # Bitcoin is extremely expensive, so we trade a fractional amount (0.15)
+            # to prevent hitting the "exceeds buying power" limit.
+            qty = 0.15 if ticker == "BTC-USD" else TRADE_QUANTITY
 
             ok = self.hands.execute_trade(
                 ticker, action, qty,
