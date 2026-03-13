@@ -617,10 +617,23 @@ class StockTrakExecutor:
                 except Exception:
                     pass
 
+                # ── Strategy 4: Fallback CSS selectors for Stock-Trak's UI ────
+                try:
+                    rank_el = self._page.locator(".portfolio-rank, #rank, .ranking-number, .student-rank").first
+                    rank_el.wait_for(state="visible", timeout=2_000)
+                    txt = rank_el.inner_text()
+                    rank_str = "".join(c for c in txt if c.isdigit())
+                    if rank_str:
+                        rank_val = int(rank_str)
+                        print(f"[Executor] Rank detected via fallback CSS selector: #{rank_val}")
+                        return rank_val
+                except Exception:
+                    pass
+
             except Exception:
                 continue  # try next URL
 
-        self._debug_screenshot("rank_sync_failed")
+        # If all strategies fail, quietly default without cluttering debug folder
         print("[Executor][Debug] Could not determine rank from any rankings page.")
         return None
 

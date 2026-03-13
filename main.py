@@ -177,7 +177,14 @@ class TradingBot:
             else:
                 # For BUY: dynamic scaling based on confidence and absolute position size limits.
                 # Max StockTrak position size is ~$9,987. We safely cap at $9,900.
-                price = matrix.get(ticker, {}).get("Last_Price", 0)
+                price = matrix.get(ticker, {}).get("current_price", 0)
+                
+                # --- Fallback Price Fetcher for Sizing ---
+                if price <= 0:
+                    print(f"[{ts()}] [Fallback] Fetching live price for {ticker} to size trade...")
+                    live_data = self.eyes.fetch_full_data(ticker, asset_class=asset_class)
+                    price = live_data.get("current_price", 0) if live_data else 0
+
                 if price <= 0:
                     print(f"[{ts()}] [Skip]   Missing price data for {ticker}, cannot size BUY.")
                     continue
