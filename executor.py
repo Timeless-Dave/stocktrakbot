@@ -183,6 +183,31 @@ class StockTrakExecutor:
             self._debug_screenshot("positions_sync_empty")
             return {}
 
+        # Execute a small JS script to efficiently pull symbol/qty from the table
+        script = """
+        () => {
+            const result = {};
+            document.querySelectorAll('table tr').forEach(tr => {
+                const tds = tr.querySelectorAll('td');
+                if(tds.length >= 2) {
+                    const sym = tds[0].innerText.trim().toUpperCase();
+                    const qtyStr = tds[1].innerText.replace(/,/g, '');
+                    const qty = parseFloat(qtyStr);
+                    if(sym && !isNaN(qty)) {
+                        result[sym] = qty;
+                    }
+                }
+            });
+            return result;
+        }
+        """
+        try:
+            qty_map = self._page.evaluate(script)
+        except Exception as e:
+            print(f"[Executor] Failed to parse quantities from positions table: {e}")
+            qty_map = {}
+
+        # Fallback raw parsing just to be safe if table format changes
         n = rows.count()
         for i in range(n):
             try:
@@ -194,20 +219,22 @@ class StockTrakExecutor:
 
             if known_upper:
                 for t in known_upper:
-                    if t in txt:
-                        owned[t] = "long"
+                    if t in txt and t not in owned:
+                        owned[t] = qty_map.get(t, 15.0)  # assume 15.0 if qty not found
                 # Also match base symbols (e.g. BTC in "BTC BITCOIN")
                 for base in known_base:
                     if base in txt:
                         # Map back to full ticker if possible
                         full = next((t for t in known_upper if t.startswith(base)), base)
-                        owned[full] = "long"
+                        if full not in owned:
+                            owned[full] = qty_map.get(base, 15.0)  # Cryptos are usually listed by base (e.g., BTC)
             else:
                 tokens = [w.strip() for w in txt.replace("\n", " ").split(" ") if w.strip()]
                 for tok in tokens:
                     if 1 <= len(tok) <= 10 and tok.isascii() and any(c.isalpha() for c in tok):
                         if tok.endswith("-USD") or (tok.isalpha() and tok.isupper() and 1 <= len(tok) <= 5):
-                            owned[tok] = "long"
+                            if tok not in owned:
+                                owned[tok] = qty_map.get(tok, 15.0)
 
         if owned:
             print(f"[Executor] Synced positions: {len(owned)} open tickers detected.")

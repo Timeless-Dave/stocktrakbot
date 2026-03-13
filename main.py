@@ -66,13 +66,13 @@ class TradingBot:
             self.hands.close()
             raise RuntimeError("[System] Login failed — aborting.")
 
-        # Track open positions to avoid doubling in / naked shorts
-        self.positions: dict[str, str | None] = {}
+        # Track open positions and their exact quantities
+        self.positions: dict[str, float] = {}
         # Seed positions from Stock-Trak so SELL decisions are valid even if the bot didn't open them
         known = self.mega_universe or [t for cls, tickers in WATCHLIST.items() for t in tickers]
         seeded = self.hands.sync_positions(known_tickers=known)
-        for t, side in seeded.items():
-            self.positions[t] = side
+        for t, qty in seeded.items():
+            self.positions[t] = qty
 
         total = len(self.mega_universe) if self.mega_universe else sum(len(v) for v in WATCHLIST.values())
         print(f"[{ts()}] [System] Online. {total} assets | 1 OpenAI call/cycle")
@@ -153,11 +153,11 @@ class TradingBot:
                 continue    # HOLD or below threshold — nothing to do
 
             # Position guard
-            current = self.positions.get(ticker)
-            if action == "BUY"  and current == "long":
-                print(f"[{ts()}] [Skip]   Already long {ticker}.")
+            current_qty = self.positions.get(ticker, 0)
+            if action == "BUY" and current_qty > 0:
+                print(f"[{ts()}] [Skip]   Already long {ticker} ({current_qty}).")
                 continue
-            if action == "SELL" and current is None:
+            if action == "SELL" and current_qty <= 0:
                 print(f"[{ts()}] [Skip]   No position in {ticker} to sell.")
                 continue
 
@@ -170,10 +170,25 @@ class TradingBot:
 
             note = f"[{action}] {ticker} ({asset_class}) — {reasoning} (conf: {confidence}%)"
 
-            # Quantity: use the fixed config value for everything except Bitcoin.
-            # Bitcoin is extremely expensive, so we trade a fractional amount (0.10)
-            # to prevent hitting the "exceeds buying power" / max position size limit.
-            qty = 0.10 if ticker == "BTC-USD" else TRADE_QUANTITY
+            # Dynamic Quantity Sizing
+            if action == "SELL":
+                # Sell EXACTLY the quantity we own to avoid breaking order logic
+                qty = self.positions.get(ticker, 0)
+            else:
+                # For BUY: dynamic scaling based on confidence and absolute position size limits.
+                # Max StockTrak position size is ~$9,987. We safely cap at $9,900.
+                price = matrix.get(ticker, {}).get("Last_Price", 0)
+                if price <= 0:
+                    print(f"[{ts()}] [Skip]   Missing price data for {ticker}, cannot size BUY.")
+                    continue
+                
+                # Confidence scaling: e.g. 95% conf => target 95% of $9000 = $8550.
+                allocation_dollars = min((confidence / 100.0) * 9000.0, 9900.0)
+                
+                if asset_class == "crypto":
+                    qty = round(allocation_dollars / price, 4)
+                else:
+                    qty = max(1, int(allocation_dollars / price))
 
             ok = self.hands.execute_trade(
                 ticker, action, qty,
@@ -184,7 +199,7 @@ class TradingBot:
             print(f"[{ts()}] [{label}]  {action} {qty}x {ticker}")
 
             if ok:
-                self.positions[ticker] = "long" if action == "BUY" else None
+                self.positions[ticker] = qty if action == "BUY" else 0
 
     # ─────────────────────────────────────────────────────────────────────────────
     def _check_rank_guard(self) -> bool:
@@ -265,7 +280,7 @@ class TradingBot:
                     continue
 
                 # PHASE 2: ONE batch OpenAI call (matrix + macro context)
-                owned = [t for t, pos in self.positions.items() if pos == "long"]
+                owned = [t for t, qty in self.positions.items() if qty > 0]
                 if not open_now:
                     # Filter out non-crypto owned assets so AI doesn't try to sell them
                     class_map = {t: cls for cls, tickers in WATCHLIST.items() for t in tickers}
