@@ -171,9 +171,9 @@ class TradingBot:
             note = f"[{action}] {ticker} ({asset_class}) — {reasoning} (conf: {confidence}%)"
 
             # Quantity: use the fixed config value for everything except Bitcoin.
-            # Bitcoin is extremely expensive, so we trade a fractional amount (0.15)
-            # to prevent hitting the "exceeds buying power" limit.
-            qty = 0.15 if ticker == "BTC-USD" else TRADE_QUANTITY
+            # Bitcoin is extremely expensive, so we trade a fractional amount (0.10)
+            # to prevent hitting the "exceeds buying power" / max position size limit.
+            qty = 0.10 if ticker == "BTC-USD" else TRADE_QUANTITY
 
             ok = self.hands.execute_trade(
                 ticker, action, qty,
