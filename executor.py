@@ -336,16 +336,32 @@ class StockTrakExecutor:
             symbol_box = self._page.locator(self._SEL_SYMBOL)
             symbol_box.click(timeout=5_000)
             symbol_box.fill("", timeout=5_000)
-            symbol_box.type(base_symbol, delay=80)
-            time.sleep(1.5)   # Let ui-autocomplete-input dropdown appear
-            # Prefer clicking an autocomplete result if present; else press Enter.
-            if not self._select_autocomplete(base_symbol):
-                self._page.keyboard.press("Enter")
-            time.sleep(2.5)    # Let live quote / form populate
+            
+            # Fill the ticker slowly to trigger the JS event
+            symbol_box.fill(base_symbol)
+            
+            # Wait for the autocomplete dropdown to physically appear on the screen
+            try:
+                self._page.wait_for_selector(".ui-autocomplete", timeout=5_000)
+            except Exception:
+                pass
+            
+            # Give it 1 extra second to ensure the list is fully populated
+            time.sleep(1.0)
+            
+            # Press Tab to lock in the top selection explicitly
+            self._page.keyboard.press("Tab")
+            
+            # Wait for the live price quote to load on the screen before moving to the quantity
+            time.sleep(2.0)
 
-            # 2. Buy/Sell — radio labels: "Buy" / "Sell" (same pattern as equities)
-            label_text = "Buy" if action == "BUY" else "Sell"
-            self._page.locator("label.button", has_text=label_text).first.click(timeout=8_000)
+            # 2. Buy/Sell — explicitly target the label on the action dropdown to prevent silently defaulting to Buy
+            try:
+                self._page.locator("#actionDropdown").select_option(label=action.capitalize(), timeout=4_000)
+            except Exception:
+                # Fallback to label clicking just in case Stock-Trak disabled the select dropdown on Crypto specifically
+                label_text = "Buy" if action == "BUY" else "Sell"
+                self._page.locator("label.button", has_text=label_text).first.click(timeout=8_000)
             time.sleep(0.5)
 
             # ── Guard: check for errors after action selection ────────────────
@@ -455,21 +471,28 @@ class StockTrakExecutor:
             symbol_box = self._page.locator(self._SEL_SYMBOL)
             symbol_box.click(timeout=8_000)
             symbol_box.fill("", timeout=5_000)          # clear first
-            symbol_box.type(ticker, delay=80)           # type slowly → triggers autocomplete
-            time.sleep(1.5)                             # wait for autocomplete list
+            
+            # Fill the ticker to trigger the JS event
+            symbol_box.fill(ticker)
+            
+            # Wait for the autocomplete dropdown to physically appear on the screen
+            try:
+                self._page.wait_for_selector(".ui-autocomplete", timeout=5_000)
+            except Exception:
+                print(f"[Executor][Warning] Autocomplete dropdown not visible for {ticker}")
+            
+            # Give it 1 extra second to ensure the list is fully populated with PLTR, not PLOO
+            time.sleep(1.0)
+            
+            # Press Tab to lock in the top selection explicitly
+            self._page.keyboard.press("Tab")
+            
+            # Wait for the live price quote to load on the screen before moving to the quantity
+            time.sleep(2.0)
 
-            # Click the first autocomplete result that matches our ticker
-            autocomplete_clicked = self._select_autocomplete(ticker)
-            if not autocomplete_clicked:
-                # Fallback: press Tab to accept whatever is in the field
-                print(f"[Executor][Warning] Autocomplete not found for {ticker}; pressing Tab.")
-                symbol_box.press("Tab")
-            time.sleep(1.2)   # Let price widget populate
-
-            # ── 3. Select Buy / Sell via label toggle buttons ─────────────────
-            label_text = "Buy" if action == "BUY" else "Sell"
-            action_label = self._page.locator("label.button", has_text=label_text).first
-            action_label.click(timeout=8_000)
+            # ── 3. Select Buy / Sell via explicit Dropdown Label ────────────────
+            # Force Playwright to select by the visible text label to avoid silently failing
+            self._page.locator("#actionDropdown").select_option(label=action.capitalize(), timeout=5_000)
             time.sleep(0.8)
 
             # ── Guard: check for errors after action selection ────────────────
