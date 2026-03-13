@@ -19,7 +19,7 @@ if hasattr(sys.stdout, "reconfigure"):
 
 from config import (
     WATCHLIST,
-    TRADE_QUANTITY,
+    TRADE_AMOUNT_DOLLARS,
     CONFIDENCE_THRESHOLD,
     CYCLE_SLEEP_SECONDS,
     MAX_FETCH_RETRIES,
@@ -130,7 +130,7 @@ class TradingBot:
         return self.eyes.screen_universe(universe, top_n=self.top_n, max_workers=10)
 
     # ─────────────────────────────────────────────────────────────────────────
-    def _execute_decisions(self, decisions: list, market_open: bool) -> None:
+    def _execute_decisions(self, decisions: list, market_open: bool, matrix: dict) -> None:
         """
         PHASE 3 — Order Execution Queue.
         Work through the model's ranked list and fire trades for high-confidence signals.
@@ -170,13 +170,26 @@ class TradingBot:
 
             note = f"[{action}] {ticker} ({asset_class}) — {reasoning} (conf: {confidence}%)"
 
+            # Dynamic quantity sizing based on a target dollar amount per trade
+            price = matrix.get(ticker, {}).get("Last_Price", 0)
+            if price > 0:
+                if asset_class == "crypto":
+                    # Fractional shares up to 4 decimal places
+                    qty = round(TRADE_AMOUNT_DOLLARS / price, 4)
+                else:
+                    # Integer shares for equities
+                    qty = max(1, int(TRADE_AMOUNT_DOLLARS / price))
+            else:
+                # Fallback if price is somehow unavailable
+                qty = 15 if asset_class != "crypto" else 0.1
+
             ok = self.hands.execute_trade(
-                ticker, action, TRADE_QUANTITY,
+                ticker, action, qty,
                 asset_class=asset_class,
                 notes=note,
             )
             label = "SUCCESS" if ok else "FAILED"
-            print(f"[{ts()}] [{label}]  {action} {TRADE_QUANTITY}x {ticker}")
+            print(f"[{ts()}] [{label}]  {action} {qty}x {ticker}")
 
             if ok:
                 self.positions[ticker] = "long" if action == "BUY" else None
@@ -273,7 +286,7 @@ class TradingBot:
                 else:
                     # PHASE 3: Execute trades — but ask first if we're in top N
                     if self._check_rank_guard():
-                        self._execute_decisions(decisions, market_open=open_now)
+                        self._execute_decisions(decisions, market_open=open_now, matrix=matrix)
                     else:
                         # Still print signals so user can see what was planned
                         for d in decisions:

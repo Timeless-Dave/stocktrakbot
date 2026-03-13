@@ -220,7 +220,7 @@ class StockTrakExecutor:
         self,
         ticker: str,
         action: str,
-        quantity: int,
+        quantity: float,
         asset_class: str = "stocks",
         notes: str = "",
     ) -> bool:
@@ -244,14 +244,14 @@ class StockTrakExecutor:
         return self._execute_equities(ticker, action, quantity, notes)
 
     def _execute_mutual_fund(self, ticker: str, action: str,
-                             quantity: int, notes: str = "") -> bool:
+                             quantity: float, notes: str = "") -> bool:
         """Place a trade on the /trading/mutualfunds page."""
         # TODO: Implement mutual fund trading logic
         print(f"[Executor][Warning] Mutual fund trading not yet implemented for {ticker}.")
         return False
 
     def _execute_crypto(self, ticker: str, action: str,
-                        quantity: int, notes: str = "") -> bool:
+                        quantity: float, notes: str = "") -> bool:
         """
         Dedicated crypto execution engine — uses https://app.stocktrak.com/trading/crypto.
         Shares the same form selectors as equities:
@@ -374,7 +374,7 @@ class StockTrakExecutor:
             return False
 
     def _execute_equities(self, ticker: str, action: str,
-                          quantity: int, notes: str = "") -> bool:
+                          quantity: float, notes: str = "") -> bool:
         """Place a trade on the /trading/equities page (stocks, ETFs, crypto, bonds)."""
         if not self.logged_in:
             print("[Executor][Warning] Not logged in — skipping trade.")
