@@ -162,6 +162,10 @@ class TradingBot:
                 continue
 
             asset_class = class_map.get(ticker, "stocks")
+            # If the ticker wasn't in WATCHLIST (e.g. mega universe expansion),
+            # infer crypto from Yahoo-format symbols like "XRP-USD".
+            if asset_class == "stocks" and isinstance(ticker, str) and ticker.upper().endswith("-USD"):
+                asset_class = "crypto"
 
             # Market Hours Guard
             if not market_open and asset_class != "crypto":
@@ -269,11 +273,16 @@ class TradingBot:
                 macro = self.eyes.fetch_macro_context()
                 print(f"[{ts()}] [Macro] VIX: {macro['VIX']} | SPY 5D: {macro['SPY_5D_Trend_Pct']}%")
 
-                # Refresh positions each cycle (prevents naked sells if you trade manually)
+                # Refresh positions each cycle (prevents naked sells if you trade manually).
+                # Explicitly zero out any ticker that is no longer in the synced data so
+                # that manually-closed positions don't trigger ghost SELL orders next cycle.
                 known = self.mega_universe or [t for cls, tickers in WATCHLIST.items() for t in tickers]
                 seeded = self.hands.sync_positions(known_tickers=known)
-                for t, side in seeded.items():
-                    self.positions[t] = side
+                for t in known:
+                    if t in seeded:
+                        self.positions[t] = seeded[t]
+                    else:
+                        self.positions[t] = 0
 
                 # PHASE 1: Ingest all data (no OpenAI calls)
                 if self.mega_universe:
