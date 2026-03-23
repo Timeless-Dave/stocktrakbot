@@ -26,6 +26,11 @@ from config import (
     HEADLESS,
     CRYPTO_ALWAYS_ON,
     RANK_GUARD_THRESHOLD,
+    MIN_HOLD_HOURS,
+    MAX_BUYS_PER_CYCLE,
+    MAX_SELLS_PER_CYCLE,
+    MIN_SELL_GAIN_PCT,
+    STOP_LOSS_PCT,
     STOCKTRAK_USER,
     STOCKTRAK_PASS,
     validate_config,
@@ -68,11 +73,18 @@ class TradingBot:
 
         # Track open positions and their exact quantities
         self.positions: dict[str, float] = {}
+        # Track when the bot opened each position (for minimum hold enforcement)
+        self.entry_times:  dict[str, datetime] = {}
+        # Track the price at entry (for P/L filter before selling)
+        self.entry_prices: dict[str, float]    = {}
+
         # Seed positions from Stock-Trak so SELL decisions are valid even if the bot didn't open them
         known = self.mega_universe or [t for cls, tickers in WATCHLIST.items() for t in tickers]
         seeded = self.hands.sync_positions(known_tickers=known)
         for t, qty in seeded.items():
             self.positions[t] = qty
+            # Seeded positions (manually opened) have no bot entry time — the hold guard
+            # uses None to indicate "we don't know when this was bought, skip hold check"
 
         total = len(self.mega_universe) if self.mega_universe else sum(len(v) for v in WATCHLIST.values())
         print(f"[{ts()}] [System] Online. {total} assets | 1 OpenAI call/cycle")
@@ -134,11 +146,20 @@ class TradingBot:
         """
         PHASE 3 — Order Execution Queue.
         Work through the model's ranked list and fire trades for high-confidence signals.
+        Guards applied (in order):
+          1. Confidence threshold
+          2. Per-cycle BUY / SELL caps
+          3. Position existence check
+          4. Minimum hold period (for bot-opened positions)
+          5. P/L filter before SELL (commission-aware)
+          6. Market hours check
         """
-        # Build a lookup of asset_class per ticker from the watchlist
         class_map: dict[str, str] = {
             t: cls for cls, tickers in WATCHLIST.items() for t in tickers
         }
+
+        buys_this_cycle  = 0
+        sells_this_cycle = 0
 
         for decision in decisions:
             ticker     = decision.get("ticker", "")
@@ -150,40 +171,76 @@ class TradingBot:
             print(f"[{ts()}] [Signal] {tag} {ticker:<10} conf={confidence}% | {reasoning}")
 
             if action not in ("BUY", "SELL") or confidence < CONFIDENCE_THRESHOLD:
-                continue    # HOLD or below threshold — nothing to do
+                continue
 
-            # Position guard
+            # ── Per-cycle trade cap ──────────────────────────────────────────
+            if action == "BUY" and buys_this_cycle >= MAX_BUYS_PER_CYCLE:
+                print(f"[{ts()}] [Skip]   BUY cap ({MAX_BUYS_PER_CYCLE}/cycle) reached — {ticker} skipped.")
+                continue
+            if action == "SELL" and sells_this_cycle >= MAX_SELLS_PER_CYCLE:
+                print(f"[{ts()}] [Skip]   SELL cap ({MAX_SELLS_PER_CYCLE}/cycle) reached — {ticker} skipped.")
+                continue
+
+            # ── Position existence guard ─────────────────────────────────────
             current_qty = self.positions.get(ticker, 0)
             if action == "BUY" and current_qty > 0:
-                print(f"[{ts()}] [Skip]   Already long {ticker} ({current_qty}).")
+                print(f"[{ts()}] [Skip]   Already long {ticker} ({current_qty} shares).")
                 continue
             if action == "SELL" and current_qty <= 0:
                 print(f"[{ts()}] [Skip]   No position in {ticker} to sell.")
                 continue
 
             asset_class = class_map.get(ticker, "stocks")
-            # If the ticker wasn't in WATCHLIST (e.g. mega universe expansion),
-            # infer crypto from Yahoo-format symbols like "XRP-USD".
             if asset_class == "stocks" and isinstance(ticker, str) and ticker.upper().endswith("-USD"):
                 asset_class = "crypto"
 
-            # Market Hours Guard
+            # ── Minimum hold period guard (SELL only) ────────────────────────
+            if action == "SELL":
+                entry_time = self.entry_times.get(ticker)
+                if entry_time is not None:
+                    hours_held = (datetime.now() - entry_time).total_seconds() / 3600.0
+                    # Check P/L to decide whether the stop-loss override applies
+                    entry_price  = self.entry_prices.get(ticker, 0.0)
+                    current_price_for_pl = matrix.get(ticker, {}).get("current_price", 0.0)
+                    if entry_price > 0 and current_price_for_pl > 0:
+                        pl_pct = ((current_price_for_pl - entry_price) / entry_price) * 100.0
+                    else:
+                        pl_pct = 0.0  # unknown — be conservative
+
+                    if hours_held < MIN_HOLD_HOURS and pl_pct > STOP_LOSS_PCT:
+                        print(
+                            f"[{ts()}] [Skip]   {ticker} held only {hours_held:.1f}h "
+                            f"(min {MIN_HOLD_HOURS}h), P/L={pl_pct:+.1f}% — too soon to sell."
+                        )
+                        continue
+
+            # ── P/L filter before SELL (commission-aware) ───────────────────
+            if action == "SELL":
+                entry_price   = self.entry_prices.get(ticker, 0.0)
+                current_price = matrix.get(ticker, {}).get("current_price", 0.0)
+                if entry_price > 0 and current_price > 0:
+                    pl_pct = ((current_price - entry_price) / entry_price) * 100.0
+                    # Allow the sell if: above min gain threshold OR in stop-loss territory
+                    if pl_pct < MIN_SELL_GAIN_PCT and pl_pct > STOP_LOSS_PCT:
+                        print(
+                            f"[{ts()}] [Skip]   {ticker} P/L={pl_pct:+.1f}% is below "
+                            f"min gain ({MIN_SELL_GAIN_PCT}%) and above stop-loss ({STOP_LOSS_PCT}%). "
+                            f"Not worth the $20 round-trip commission."
+                        )
+                        continue
+
+            # ── Market hours guard ───────────────────────────────────────────
             if not market_open and asset_class != "crypto":
                 print(f"[{ts()}] [Skip]   Market closed — cannot trade {ticker} ({asset_class}).")
                 continue
 
             note = f"[{action}] {ticker} ({asset_class}) — {reasoning} (conf: {confidence}%)"
 
-            # Dynamic Quantity Sizing
+            # ── Dynamic quantity sizing ──────────────────────────────────────
             if action == "SELL":
-                # Sell EXACTLY the quantity we own to avoid breaking order logic
                 qty = self.positions.get(ticker, 0)
             else:
-                # For BUY: dynamic scaling based on confidence and absolute position size limits.
-                # Max StockTrak position size is ~$9,987. We safely cap at $9,900.
                 price = matrix.get(ticker, {}).get("current_price", 0)
-                
-                # --- Fallback Price Fetcher for Sizing ---
                 if price <= 0:
                     print(f"[{ts()}] [Fallback] Fetching live price for {ticker} to size trade...")
                     live_data = self.eyes.fetch_full_data(ticker, asset_class=asset_class)
@@ -192,10 +249,9 @@ class TradingBot:
                 if price <= 0:
                     print(f"[{ts()}] [Skip]   Missing price data for {ticker}, cannot size BUY.")
                     continue
-                
-                # Confidence scaling: e.g. 95% conf => target 95% of $9000 = $8550.
+
+                # Confidence scaling: 95% conf -> 95% of $9,000 = $8,550 (cap at $9,900)
                 allocation_dollars = min((confidence / 100.0) * 9000.0, 9900.0)
-                
                 if asset_class == "crypto":
                     qty = round(allocation_dollars / price, 4)
                 else:
@@ -210,7 +266,19 @@ class TradingBot:
             print(f"[{ts()}] [{label}]  {action} {qty}x {ticker}")
 
             if ok:
-                self.positions[ticker] = qty if action == "BUY" else 0
+                if action == "BUY":
+                    self.positions[ticker]   = qty
+                    self.entry_times[ticker]  = datetime.now()
+                    # Store the price at entry for P/L tracking
+                    buy_price = matrix.get(ticker, {}).get("current_price", 0.0)
+                    if buy_price > 0:
+                        self.entry_prices[ticker] = buy_price
+                    buys_this_cycle += 1
+                else:
+                    self.positions[ticker]  = 0
+                    self.entry_times.pop(ticker,  None)
+                    self.entry_prices.pop(ticker, None)
+                    sells_this_cycle += 1
 
     # ─────────────────────────────────────────────────────────────────────────────
     def _check_rank_guard(self) -> bool:
@@ -331,17 +399,23 @@ class TradingBot:
 
 
 if __name__ == "__main__":
+    # Focused universe: 20 high-quality tickers.
+    # Fewer tickers = faster scans, less yfinance churn, and tighter signal quality.
+    # The screener will send only the top 10 by volume surge to OpenAI each cycle.
     MEGA_UNIVERSE = [
-        # Big Tech & AI
-        "AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META", "TSLA", "TSM", "AVGO", "AMD",
-        # Momentum & High Volatility
-        "PLTR", "MCD", "JNJ", "PEP", "NOW", "INTU", "GE", "NFLX", "UBER", "CRWD",
-        "SNOW", "PANW", "SMCI", "COIN", "HOOD", "RBLX", "SHOP", "SPOT", "ARM",
-        # Cryptos
-        "BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD", "ADA-USD",
-        # ETFs for broad exposure
-        "SPY", "QQQ", "IWM", "ARKK", "XLE", "XLF",
+        # Core large-cap tech (highest liquidity, tight spreads)
+        "AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META",
+        # High-beta / AI plays worth watching
+        "PLTR", "TSLA", "AMD", "CRWD",
+        # Defensive / dividend anchors (balance the portfolio)
+        "JNJ", "PEP", "MCD",
+        # Broad market ETFs (macro hedge)
+        "SPY", "QQQ",
+        # Crypto (always-on, 24/7 signals)
+        "BTC-USD", "ETH-USD", "SOL-USD",
+        # Commodities / sector hedge
+        "GLD", "XLE",
     ]
 
-    bot = TradingBot(mega_universe=MEGA_UNIVERSE, top_n=30)
+    bot = TradingBot(mega_universe=MEGA_UNIVERSE, top_n=10)
     bot.run()

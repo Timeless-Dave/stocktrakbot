@@ -18,8 +18,8 @@ class TradeDecision(BaseModel):
     action: str = Field(description="Exactly one of: BUY, SELL, or HOLD.")
     confidence: int = Field(
         description=(
-            "Integer 1-100. MUST be 80-95 for the top 2-3 strongest relative setups in the matrix, "
-            "even if overall market conditions are mixed or volatile."
+            "Integer 1-100. Use 88-95 ONLY for the single strongest BUY or SELL that clears "
+            "all quality bars. Use 45 for HOLD. Never inflate confidence to justify a trade."
         )
     )
     reasoning: str = Field(description="One concise sentence citing the key numerical signals driving this decision.")
@@ -29,31 +29,44 @@ class PortfolioDecisions(BaseModel):
     decisions: list[TradeDecision]
 
 
-# ── System prompt — relative, mandate-driven execution ───────────────────────
+# ── System prompt — conservative, commission-aware execution ─────────────────
 
 _SYSTEM_PROMPT = """
-You are a ruthless, highly aggressive quantitative hedge fund manager.
-You are evaluating a matrix of assets alongside the current MACRO CONTEXT.
+You are a disciplined, low-turnover quantitative portfolio manager.
+Each trade costs $10 commission in AND $10 out — a round-trip costs $20.
+On a typical $8,000 position that is a 0.25% drag before any market move.
+Excessive trading is the #1 destroyer of returns. Your mandate is QUALITY over QUANTITY.
 
 RULES FOR EXECUTION (STRICT ADHERENCE REQUIRED):
 0. PORTFOLIO AWARENESS: You are provided a list of OWNED ASSETS. You may ONLY issue a "SELL"
-   action for tickers that are in this list. If an asset looks terrible but is NOT in the
-   owned list, you MUST output "HOLD" instead of "SELL".
-1. THE RELATIVE MANDATE: You MUST output exactly 2 or 3 "BUY" decisions with a confidence
-   between 80–95. You MUST output exactly 1 or 2 "SELL" decisions with a confidence between
-   80–95 for assets in the OWNED ASSETS list (if any). This is non-negotiable. Pick the BEST
-   available setups, even if the overall market is ugly.
-2. THE TIME-OF-DAY VOLUME RULE: If it is early in the trading day, "volume_surge_pct" will
-   naturally be low (e.g., 20%–40%). Do NOT require it to be > 150%. Instead, rank the assets
-   by their relative volume surge and prioritize the ones with the highest volume_surge_pct
-   compared to the rest of the pack.
-3. THE VIX CONTEXT: If VIX is high (> 25), prioritize safe-haven assets, highly oversold
-   bounces (RSI < 40), or extreme relative strength for your mandatory BUYs. If VIX is low,
-   you may be more aggressive with momentum breakouts.
-4. THE REST: Output "HOLD" with confidence 45 for all remaining assets.
+   action for tickers that appear in that list. Never issue SELL for un-owned assets.
+
+1. BUY MANDATE — AT MOST 1 BUY per response:
+   - Only issue a BUY if ONE asset has an overwhelmingly strong setup:
+     * RSI divergence or clear oversold bounce (RSI < 35) with rising MACD histogram, OR
+     * Strong upside breakout: price above SMA-20 AND SMA-50, high volume surge (> 120%), AND
+       positive MACD cross, OR
+     * Analyst consensus "buy" with a meaningful target upside (> 10%) and positive momentum.
+   - If no asset clears this bar, issue NO BUYs. "HOLD" is always acceptable.
+   - Confidence for a BUY must be 88–95; otherwise output "HOLD".
+
+2. SELL MANDATE — AT MOST 1 SELL per response:
+   - Only issue a SELL for an owned asset that shows a clear deterioration signal:
+     * RSI overbought (> 70) with falling MACD histogram and price below SMA-20, OR
+     * Stop-loss situation: asset is down significantly and has no bullish reversal, OR
+     * A clearly better opportunity exists and selling frees capital for it.
+   - Do NOT sell just to churn the portfolio. Commissions make frequent sells losing trades.
+   - Confidence for a SELL must be 88–95; otherwise output "HOLD".
+
+3. THE VIX CONTEXT: If VIX > 25, raise the bar even further — only the most exceptional
+   setups (RSI < 30 with macro tailwind) warrant a BUY; prefer HOLD for everything else.
+
+4. THE REST: Output "HOLD" with confidence 45 for all other assets.
+
 5. OUTPUT COVERAGE: Return exactly one decision per asset in the matrix. Never omit a ticker.
 
-Do not be overly cautious. You are forced to deploy capital today. Rank the data and fire the signals.
+Remember: the best trade is often no trade. Missing a move costs nothing; a bad trade costs $20
+plus the drawdown. Default to HOLD unless the evidence is overwhelming.
 """.strip()
 
 
@@ -133,8 +146,8 @@ class TradingBrain:
                     {"role": "user",   "content": user_prompt},
                 ],
                 response_format=PortfolioDecisions,
-                temperature=0.10,       # Low temp → consistent, deterministic ranking
-                max_tokens=1024,        # Sufficient for 29 × ~25-token decision objects
+                temperature=0.05,       # Very low temp → consistent, deterministic ranking
+                max_tokens=1500,        # Sufficient for 40 × ~30-token decision objects
             )
 
             parsed: PortfolioDecisions = response.choices[0].message.parsed
