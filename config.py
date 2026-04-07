@@ -41,7 +41,9 @@ TRADE_QUANTITY: int = 15
 # Only act on very high-conviction signals. 302 trades in one session at $10/ea
 # cost ~$3,020 in commissions and destroyed the Sharpe ratio. Raising this
 # eliminates low-quality churn.
-CONFIDENCE_THRESHOLD: int = 88
+# Execution gate for BUY/SELL. If set too high, the model will never clear it
+# (especially during high-VIX regimes) and the bot will place zero trades.
+CONFIDENCE_THRESHOLD: int = int(os.getenv("CONFIDENCE_THRESHOLD", "80"))
 
 # One cycle per hour instead of every 15 min.
 # Old: 4 cycles/hr × 1 OpenAI call = 4 calls/hr → ~26 calls/day (ok)
@@ -56,6 +58,9 @@ CRYPTO_ALWAYS_ON: bool = True        # crypto analysed even when market closed
 # asks before placing trades when we're inside the top 10.
 RANK_GUARD_THRESHOLD: int = 10
 RANK_GUARD_MODE: str = (os.getenv("RANK_GUARD_MODE", "prompt").strip().lower() or "prompt")
+
+# OpenAI model selection. Override in `.env` as needed.
+OPENAI_MODEL: str = (os.getenv("OPENAI_MODEL", "gpt-4o").strip() or "gpt-4o")
 
 # Minimum hours a position must be held before the bot will consider selling it.
 # Prevents same-session round-trips that cost 2 × $10 commission for no gain.
@@ -96,4 +101,8 @@ def validate_config() -> None:
     if RANK_GUARD_MODE not in {"prompt", "skip", "allow"}:
         raise EnvironmentError(
             "[Config] RANK_GUARD_MODE must be one of: prompt, skip, allow."
+        )
+    if CONFIDENCE_THRESHOLD < 50 or CONFIDENCE_THRESHOLD > 99:
+        raise EnvironmentError(
+            "[Config] CONFIDENCE_THRESHOLD must be between 50 and 99."
         )

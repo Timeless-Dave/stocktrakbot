@@ -18,8 +18,8 @@ class TradeDecision(BaseModel):
     action: str = Field(description="Exactly one of: BUY, SELL, or HOLD.")
     confidence: int = Field(
         description=(
-            "Integer 1-100. Use 88-95 ONLY for the single strongest BUY or SELL that clears "
-            "all quality bars. Use 45 for HOLD. Never inflate confidence to justify a trade."
+            "Integer 1-100. Use 80-95 for a BUY/SELL you genuinely want executed. "
+            "Use 50-70 for HOLD. Never inflate confidence to justify a trade."
         )
     )
     reasoning: str = Field(description="One concise sentence citing the key numerical signals driving this decision.")
@@ -42,13 +42,13 @@ RULES FOR EXECUTION (STRICT ADHERENCE REQUIRED):
    action for tickers that appear in that list. Never issue SELL for un-owned assets.
 
 1. BUY MANDATE — AT MOST 1 BUY per response:
-   - Only issue a BUY if ONE asset has an overwhelmingly strong setup:
+   - Only issue a BUY if ONE asset has a clearly strong setup (avoid churn):
      * RSI divergence or clear oversold bounce (RSI < 35) with rising MACD histogram, OR
      * Strong upside breakout: price above SMA-20 AND SMA-50, high volume surge (> 120%), AND
        positive MACD cross, OR
      * Analyst consensus "buy" with a meaningful target upside (> 10%) and positive momentum.
    - If no asset clears this bar, issue NO BUYs. "HOLD" is always acceptable.
-   - Confidence for a BUY must be 88–95; otherwise output "HOLD".
+   - Confidence for a BUY must be 80–95; otherwise output "HOLD".
 
 2. SELL MANDATE — AT MOST 1 SELL per response:
    - Only issue a SELL for an owned asset that shows a clear deterioration signal:
@@ -56,12 +56,12 @@ RULES FOR EXECUTION (STRICT ADHERENCE REQUIRED):
      * Stop-loss situation: asset is down significantly and has no bullish reversal, OR
      * A clearly better opportunity exists and selling frees capital for it.
    - Do NOT sell just to churn the portfolio. Commissions make frequent sells losing trades.
-   - Confidence for a SELL must be 88–95; otherwise output "HOLD".
+   - Confidence for a SELL must be 80–95; otherwise output "HOLD".
 
-3. THE VIX CONTEXT: If VIX > 25, raise the bar even further — only the most exceptional
-   setups (RSI < 30 with macro tailwind) warrant a BUY; prefer HOLD for everything else.
+3. THE VIX CONTEXT: If VIX > 25, be more selective, but still allow exceptional setups
+   (e.g., RSI < 32 with improving MACD histogram or breakout with strong volume surge).
 
-4. THE REST: Output "HOLD" with confidence 45 for all other assets.
+4. THE REST: Output "HOLD" with confidence 50-70 for all other assets.
 
 5. OUTPUT COVERAGE: Return exactly one decision per asset in the matrix. Never omit a ticker.
 
@@ -83,7 +83,7 @@ class TradingBrain:
                 "[Brain] OPENAI_API_KEY not set. Add it to your .env file."
             )
         self._client = OpenAI(api_key=api_key)
-        self._model  = "gpt-4o-mini"
+        self._model  = (os.environ.get("OPENAI_MODEL", "gpt-4o").strip() or "gpt-4o")
 
     # ─────────────────────────────────────────────────────────────────────────
     def analyze_portfolio(
@@ -111,7 +111,7 @@ class TradingBrain:
             owned_assets = []
 
         n = len(market_matrix)
-        print(f"[Brain] Batch-analysing {n} assets via OpenAI gpt-4o-mini (with macro context)...")
+        print(f"[Brain] Batch-analysing {n} assets via OpenAI {self._model} (with macro context)...")
 
         # Compact the matrix — drop internal bookkeeping keys to save tokens
         _DROP = {"last_updated", "asset_class"}

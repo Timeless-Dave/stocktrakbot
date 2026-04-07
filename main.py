@@ -38,6 +38,7 @@ from config import (
 from data_fetcher import MarketDataFetcher
 from brain import TradingBrain
 from executor import StockTrakExecutor
+from decision_utils import sanitize_decisions
 
 
 def ts() -> str:
@@ -301,6 +302,21 @@ class TradingBot:
         print(f"[{ts()}] [Rank] Current leaderboard position: #{rank}")
 
         if rank <= RANK_GUARD_THRESHOLD:
+            mode = "prompt"
+            try:
+                # Allow config to control behavior when in top N.
+                from config import RANK_GUARD_MODE
+                mode = (RANK_GUARD_MODE or "prompt").strip().lower()
+            except Exception:
+                mode = "prompt"
+
+            if mode == "allow":
+                print(f"[{ts()}] [Rank] Guard tripped but RANK_GUARD_MODE=allow — proceeding without prompt.")
+                return True
+            if mode == "skip":
+                print(f"[{ts()}] [Rank] Guard tripped and RANK_GUARD_MODE=skip — skipping trades this cycle.")
+                return False
+
             print()
             print("=" * 60)
             print(f"  ⚠️  YOU ARE RANK #{rank} — TOP {RANK_GUARD_THRESHOLD} GUARD ACTIVE")
@@ -375,6 +391,9 @@ class TradingBot:
                 if not decisions:
                     print(f"[{ts()}] [Warning] No decisions returned from OpenAI.")
                 else:
+                    decisions, warnings = sanitize_decisions(decisions, matrix, owned_assets=owned)
+                    for w in warnings:
+                        print(f"[{ts()}] [Decision][Warn] {w}")
                     # PHASE 3: Execute trades — but ask first if we're in top N
                     if self._check_rank_guard():
                         self._execute_decisions(decisions, market_open=open_now, matrix=matrix)
