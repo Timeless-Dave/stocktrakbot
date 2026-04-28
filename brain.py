@@ -18,8 +18,10 @@ class TradeDecision(BaseModel):
     action: str = Field(description="Exactly one of: BUY, SELL, or HOLD.")
     confidence: int = Field(
         description=(
-            "Integer 1-100. Use 80-95 for a BUY/SELL you genuinely want executed. "
-            "Use 50-70 for HOLD. Never inflate confidence to justify a trade."
+            "Integer 1-100. "
+            "75-95: actionable BUY or SELL — execute. "
+            "65-74: marginal signal — HOLD unless best in universe. "
+            "50-64: no signal — HOLD."
         )
     )
     reasoning: str = Field(description="One concise sentence citing the key numerical signals driving this decision.")
@@ -29,44 +31,105 @@ class PortfolioDecisions(BaseModel):
     decisions: list[TradeDecision]
 
 
-# ── System prompt — conservative, commission-aware execution ─────────────────
+# ── System prompt — competition-mode aggressive momentum trading ──────────────
 
 _SYSTEM_PROMPT = """
-You are a disciplined, low-turnover quantitative portfolio manager.
-Each trade costs $10 commission in AND $10 out — a round-trip costs $20.
-On a typical $8,000 position that is a 0.25% drag before any market move.
-Excessive trading is the #1 destroyer of returns. Your mandate is QUALITY over QUANTITY.
+You are an aggressive competition trader in a simulated stock market contest (HBCU Stock Market Challenge).
+Your SOLE OBJECTIVE is to maximize total portfolio return and finish #1 on the leaderboard.
+Commission is $10/trade in + $10/trade out. On a $12,000 position that is ~0.17% round-trip —
+negligible if the trade captures a 1-3% move. Do NOT let commission fear stop you from acting.
 
-RULES FOR EXECUTION (STRICT ADHERENCE REQUIRED):
-0. PORTFOLIO AWARENESS: You are provided a list of OWNED ASSETS. You may ONLY issue a "SELL"
-   action for tickers that appear in that list. Never issue SELL for un-owned assets.
+COMPETITION REALITY:
+- Other contestants are taking concentrated, high-conviction bets. Sitting in cash = falling behind.
+- Missing a 5% move on NVDA or BTC because you were "cautious" is a real cost in the standings.
+- The winner takes risk. Your job is to take SMART, CALCULATED risk every single cycle.
+- You have 2 BUY slots and 2 SELL slots per response. Use them when clear setups exist.
 
-1. BUY MANDATE — AT MOST 1 BUY per response:
-   - Only issue a BUY if ONE asset has a clearly strong setup (avoid churn):
-     * RSI divergence or clear oversold bounce (RSI < 35) with rising MACD histogram, OR
-     * Strong upside breakout: price above SMA-20 AND SMA-50, high volume surge (> 120%), AND
-       positive MACD cross, OR
-     * Analyst consensus "buy" with a meaningful target upside (> 10%) and positive momentum.
-   - If no asset clears this bar, issue NO BUYs. "HOLD" is always acceptable.
-   - Confidence for a BUY must be 80–95; otherwise output "HOLD".
+OWNED ASSETS RULE: You may ONLY issue SELL for tickers listed under OWNED ASSETS. Never sell un-owned assets.
 
-2. SELL MANDATE — AT MOST 1 SELL per response:
-   - Only issue a SELL for an owned asset that shows a clear deterioration signal:
-     * RSI overbought (> 70) with falling MACD histogram and price below SMA-20, OR
-     * Stop-loss situation: asset is down significantly and has no bullish reversal, OR
-     * A clearly better opportunity exists and selling frees capital for it.
-   - Do NOT sell just to churn the portfolio. Commissions make frequent sells losing trades.
-   - Confidence for a SELL must be 80–95; otherwise output "HOLD".
+═══════════════════════════════════════════════════════
+BUY SIGNALS — issue BUY (confidence 75-95) if ANY apply:
+═══════════════════════════════════════════════════════
 
-3. THE VIX CONTEXT: If VIX > 25, be more selective, but still allow exceptional setups
-   (e.g., RSI < 32 with improving MACD histogram or breakout with strong volume surge).
+A) MOMENTUM BREAKOUT (strongest signal):
+   • price > sma_20 AND price > sma_50
+   • RSI between 50-68 (trending, not overbought)
+   • macd_hist > 0 and rising (positive momentum)
+   • volume_surge_pct > 115% (buying interest confirmed)
+   → Confidence 82-92. This is the competition-winning setup.
 
-4. THE REST: Output "HOLD" with confidence 50-70 for all other assets.
+B) OVERSOLD BOUNCE (buy the dip):
+   • RSI < 38 AND macd_hist turning from negative toward zero (improving)
+   • analyst recommendation = "buy" or "strong_buy" with target upside > 10%
+   • bb_pct < 0.25 (near lower Bollinger Band — value zone)
+   → Confidence 78-88. Wait for the macd_hist to actually start improving.
 
-5. OUTPUT COVERAGE: Return exactly one decision per asset in the matrix. Never omit a ticker.
+C) TREND CONTINUATION (ride the winner):
+   • price > sma_20, RSI 52-65 (healthy uptrend, not exhausted)
+   • macd_hist positive for multiple periods
+   • volume_surge_pct > 105% (consistent accumulation)
+   → Confidence 75-85. Good for momentum stocks already moving.
 
-Remember: the best trade is often no trade. Missing a move costs nothing; a bad trade costs $20
-plus the drawdown. Default to HOLD unless the evidence is overwhelming.
+D) CRYPTO MOMENTUM (24/7 opportunity):
+   • RSI between 42-62, macd_hist positive or turning positive
+   • bb_pct between 0.35-0.70 (middle range, room to move)
+   • volume_surge_pct > 110%
+   → Confidence 75-85. Crypto can gap 5-10% overnight.
+
+E) NEWS CATALYST:
+   • recent_news contains a clear positive catalyst (contract win, beat, upgrade)
+   • analyst recommendation = "buy" or "strong_buy"
+   • price is below analyst_target by > 12%
+   → Confidence 78-90. News + analyst agreement = strong edge.
+
+At most 2 BUYs per response. Rank your top picks by composite signal strength.
+If only 1 clear setup exists, output 1 BUY. If none clear the bar, output 0 BUYs.
+
+════════════════════════════════════════════════════════
+SELL SIGNALS — issue SELL (confidence 75-95) if ANY apply:
+════════════════════════════════════════════════════════
+
+A) PROFIT ROTATION (take gains, redeploy):
+   • RSI > 67 AND macd_hist declining (momentum fading)
+   • bb_pct > 0.80 (near upper Bollinger Band — extended)
+   • Price is up significantly and a clearly better BUY opportunity exists
+   → Confidence 78-90. Lock in gains and rotate to the better setup.
+
+B) MOMENTUM BREAKDOWN:
+   • price drops below sma_20 AND macd turns negative
+   • RSI < 45 and falling (distribution)
+   → Confidence 78-88. Trend is broken; exit before it gets worse.
+
+C) STOP-LOSS (capital protection):
+   • Position down > 2.5% from entry with no reversal (no improving macd_hist)
+   • RSI still falling, no volume reversal
+   → Confidence 80-92. Cut the loss now; protect capital for better trade.
+
+At most 2 SELLs per response. Never sell unless position clearly deteriorating or a better setup exists.
+
+════════════════════════════════════════════════════════
+VIX & MACRO GUIDANCE:
+════════════════════════════════════════════════════════
+VIX < 15: Fully aggressive. All valid setups get executed.
+VIX 15-25: Normal. Use the signals above as written.
+VIX 25-35: Prefer oversold bounces and crypto. Breakouts still valid with extra confirmation.
+VIX > 35: Only highest-conviction setups (confidence ≥ 85). Buy the dip aggressively.
+High VIX + strong negative SPY trend: protect capital, prefer HOLD. Wait for reversal signal.
+
+════════════════════════════════════════════════════════
+CONFIDENCE CALIBRATION:
+════════════════════════════════════════════════════════
+85-95: Multiple confirming signals. BUY or SELL immediately.
+75-84: 2+ confirming signals. BUY or SELL.
+65-74: Only 1 signal, marginal. HOLD (don't waste commission).
+50-64: No clear signal. HOLD.
+
+COMPETITION END NOTE: Days remaining is provided. If ≤ 7 days left, lower your bar — act on
+any 72+ confidence signal. If ≤ 3 days left, any 68+ confidence setup with positive momentum is a BUY.
+Time remaining changes the risk/reward math.
+
+OUTPUT REQUIREMENT: Exactly one decision per ticker in the matrix. Never omit a ticker.
+Target: find the 1-2 BEST buys and 0-2 SELLs per cycle. Find them and ACT.
 """.strip()
 
 
@@ -91,14 +154,19 @@ class TradingBrain:
         market_matrix: dict,
         macro_context: dict | None = None,
         owned_assets: list[str] | None = None,
+        current_rank: int | None = None,
+        days_remaining: int | None = None,
     ) -> list[dict]:
         """
-        Send the entire market data snapshot + macro context in one API call.
+        Send the entire market data snapshot + macro + competition context in one API call.
 
         Parameters
         ----------
-        market_matrix : { ticker: { asset_class, current_price, rsi_14, volume_surge_pct, ... } }
-        macro_context : { VIX, SPY_5D_Trend_Pct } — optional; defaults if omitted.
+        market_matrix    : { ticker: { asset_class, current_price, rsi_14, ... } }
+        macro_context    : { VIX, SPY_5D_Trend_Pct }
+        owned_assets     : tickers currently held (eligible for SELL)
+        current_rank     : leaderboard rank (1 = first place) — tunes aggression
+        days_remaining   : calendar days until competition ends
 
         Returns
         -------
@@ -111,7 +179,8 @@ class TradingBrain:
             owned_assets = []
 
         n = len(market_matrix)
-        print(f"[Brain] Batch-analysing {n} assets via OpenAI {self._model} (with macro context)...")
+        print(f"[Brain] Batch-analysing {n} assets via OpenAI {self._model} "
+              f"(rank={current_rank}, days_left={days_remaining})...")
 
         # Compact the matrix — drop internal bookkeeping keys to save tokens
         _DROP = {"last_updated", "asset_class"}
@@ -126,15 +195,39 @@ class TradingBrain:
             for tkr, data in market_matrix.items()
         )
 
+        # Competition context block for the model
+        rank_str = f"#{current_rank}" if current_rank else "unknown"
+        days_str = str(days_remaining) if days_remaining is not None else "unknown"
+        # Derive urgency guidance based on rank + time remaining
+        if days_remaining is not None and days_remaining <= 3:
+            urgency = "FINAL DAYS — lower the bar to 68+ confidence. Take every clean setup. No regrets."
+        elif days_remaining is not None and days_remaining <= 7:
+            urgency = "COMPETITION CRUNCH — act on 72+ confidence. Find at least 1-2 trades this cycle."
+        elif current_rank is not None and current_rank > 5:
+            urgency = "BEHIND THE LEADERS — need aggressive momentum trades to climb. At least 1-2 BUYs."
+        elif current_rank is not None and current_rank <= 3:
+            urgency = "IN THE TOP 3 — protect the lead with smart trades; still take strong setups."
+        else:
+            urgency = "Normal competition mode — find the best 1-2 setups and execute."
+
+        competition_block = (
+            f"COMPETITION STATUS:\n"
+            f"  Current rank: {rank_str}\n"
+            f"  Days remaining: {days_str}\n"
+            f"  Guidance: {urgency}\n\n"
+        )
+
         user_prompt = (
             f"MACRO CONTEXT:\n"
             f"  VIX (fear/volatility): {macro_context['VIX']}\n"
             f"  SPY 5-day trend %: {macro_context['SPY_5D_Trend_Pct']}%\n\n"
+            f"{competition_block}"
             f"OWNED ASSETS (eligible for SELL):\n{owned_assets}\n\n"
             f"Asset-class labels:\n{asset_labels}\n\n"
             f"Market Matrix ({n} assets):\n"
             f"{json.dumps(compact, indent=2)}\n\n"
-            "Apply the rules (volume surge, VIX, relative strength) and return decisions for ALL assets listed."
+            "Scan every asset above. Identify the 1-2 STRONGEST BUY setups and any SELL candidates. "
+            "Return one decision per asset. Never omit a ticker."
         )
 
         try:
@@ -146,8 +239,8 @@ class TradingBrain:
                     {"role": "user",   "content": user_prompt},
                 ],
                 response_format=PortfolioDecisions,
-                temperature=0.05,       # Very low temp → consistent, deterministic ranking
-                max_tokens=1500,        # Sufficient for 40 × ~30-token decision objects
+                temperature=0.03,       # Very low temp → consistent, deterministic decisions
+                max_tokens=2000,        # Sufficient for 30 × ~40-token decision objects
             )
 
             parsed: PortfolioDecisions = response.choices[0].message.parsed

@@ -87,33 +87,41 @@ def sanitize_decisions(
             f"Model omitted {len(missing)} asset(s); missing tickers defaulted to HOLD."
         )
 
+    # Allow up to 2 BUYs and 2 SELLs per cycle — matches MAX_BUYS/SELLS_PER_CYCLE in config.
+    # If the model somehow returns 3+, keep the top 2 by confidence.
+    _MAX_PER_ACTION = 2
     for action_name in ("BUY", "SELL"):
         candidates = [
             sanitized[ticker]
             for ticker in ordered_tickers
             if sanitized[ticker]["action"] == action_name
         ]
-        if len(candidates) <= 1:
+        if len(candidates) <= _MAX_PER_ACTION:
             continue
 
-        winner = max(
+        # Keep the top-N by confidence; demote the rest to HOLD
+        top_n = sorted(
             candidates,
             key=lambda item: (item["confidence"], -ordered_tickers.index(item["ticker"])),
-        )
+            reverse=True,
+        )[:_MAX_PER_ACTION]
+        keep_tickers = {item["ticker"] for item in top_n}
+
         for item in candidates:
-            if item["ticker"] == winner["ticker"]:
+            if item["ticker"] in keep_tickers:
                 continue
             sanitized[item["ticker"]] = {
                 "ticker": item["ticker"],
                 "action": "HOLD",
                 "confidence": 45,
                 "reasoning": (
-                    f"Converted to HOLD because multiple {action_name} signals were returned; "
-                    f"kept only the strongest validated {action_name}."
+                    f"Converted to HOLD: more than {_MAX_PER_ACTION} {action_name} signals returned; "
+                    f"kept top-{_MAX_PER_ACTION} by confidence."
                 ),
             }
+        kept_str = ", ".join(t["ticker"] for t in top_n)
         warnings.append(
-            f"Model returned multiple {action_name} signals; kept {winner['ticker']} and converted the rest to HOLD."
+            f"Model returned {len(candidates)} {action_name} signals; kept top-{_MAX_PER_ACTION}: {kept_str}."
         )
 
     return [sanitized[ticker] for ticker in ordered_tickers], warnings

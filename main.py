@@ -7,12 +7,12 @@ Three-phase cycle per iteration:
 
 API call math:
   Before: 29 tickers × 4 cycles/hr = 116 OpenAI calls/hr  → daily limit hit
-  After:   1 batch  × 4 cycles/hr =   4 OpenAI calls/hr  → 26 calls/trading day
+  After:   1 batch  × 2 cycles/hr =   2 OpenAI calls/hr  → 13 calls/trading day
 """
 import sys
 import time
 import pytz
-from datetime import datetime
+from datetime import datetime, date
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -33,16 +33,31 @@ from config import (
     STOP_LOSS_PCT,
     STOCKTRAK_USER,
     STOCKTRAK_PASS,
+    BOT_STATE_FILE,
+    TRADE_LEDGER_FILE,
+    COMPETITION_END_DATE,
+    POSITION_BASE_CAPITAL,
     validate_config,
 )
 from data_fetcher import MarketDataFetcher
 from brain import TradingBrain
 from executor import StockTrakExecutor
 from decision_utils import sanitize_decisions
+from state_store import BotStateStore
 
 
 def ts() -> str:
     return datetime.now().strftime("%H:%M:%S")
+
+
+def _days_remaining() -> int:
+    """Calendar days until competition end date."""
+    try:
+        end = date.fromisoformat(COMPETITION_END_DATE)
+        delta = (end - date.today()).days
+        return max(0, delta)
+    except Exception:
+        return 30  # safe default
 
 
 def is_market_open() -> bool:
@@ -65,30 +80,35 @@ class TradingBot:
         self.eyes   = MarketDataFetcher()
         self.brain  = TradingBrain()
         self.hands  = StockTrakExecutor(headless=HEADLESS)
+        self.store  = BotStateStore(BOT_STATE_FILE, TRADE_LEDGER_FILE)
         self.mega_universe = mega_universe
         self.top_n = top_n
+
+        # Competition context — updated each cycle
+        self._current_rank: int | None = None
 
         if not self.hands.login(STOCKTRAK_USER, STOCKTRAK_PASS):
             self.hands.close()
             raise RuntimeError("[System] Login failed — aborting.")
 
-        # Track open positions and their exact quantities
-        self.positions: dict[str, float] = {}
-        # Track when the bot opened each position (for minimum hold enforcement)
-        self.entry_times:  dict[str, datetime] = {}
-        # Track the price at entry (for P/L filter before selling)
-        self.entry_prices: dict[str, float]    = {}
+        # Load persisted state first (survives restarts)
+        saved_pos, saved_times, saved_prices = self.store.load()
+        self.positions:    dict[str, float]    = saved_pos
+        self.entry_times:  dict[str, datetime] = saved_times
+        self.entry_prices: dict[str, float]    = saved_prices
+        if saved_pos:
+            print(f"[{ts()}] [State] Loaded {len(saved_pos)} positions from disk: {list(saved_pos.keys())}")
 
-        # Seed positions from Stock-Trak so SELL decisions are valid even if the bot didn't open them
+        # Merge live positions from Stock-Trak (source of truth for quantities)
         known = self.mega_universe or [t for cls, tickers in WATCHLIST.items() for t in tickers]
         seeded = self.hands.sync_positions(known_tickers=known)
         for t, qty in seeded.items():
             self.positions[t] = qty
-            # Seeded positions (manually opened) have no bot entry time — the hold guard
-            # uses None to indicate "we don't know when this was bought, skip hold check"
+            # Don't overwrite entry_times/prices for positions we already tracked
 
         total = len(self.mega_universe) if self.mega_universe else sum(len(v) for v in WATCHLIST.values())
-        print(f"[{ts()}] [System] Online. {total} assets | 1 OpenAI call/cycle")
+        days_left = _days_remaining()
+        print(f"[{ts()}] [System] Online. {total} assets | 1 OpenAI call/cycle | {days_left} days to competition end")
         print("-" * 60)
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -251,8 +271,11 @@ class TradingBot:
                     print(f"[{ts()}] [Skip]   Missing price data for {ticker}, cannot size BUY.")
                     continue
 
-                # Confidence scaling: 95% conf -> 95% of $9,000 = $8,550 (cap at $9,900)
-                allocation_dollars = min((confidence / 100.0) * 9000.0, 9900.0)
+                # Target 12% of base capital per position, scaled by confidence.
+                # 95% conf = 0.95 × 12,000 = $11,400. Cap at $14,000 to stay within
+                # StockTrak's typical 15% max-position limit on a $100K portfolio.
+                target_dollars = POSITION_BASE_CAPITAL * 0.12
+                allocation_dollars = min((confidence / 100.0) * target_dollars, 14_000.0)
                 if asset_class == "crypto":
                     qty = round(allocation_dollars / price, 4)
                 else:
@@ -267,19 +290,32 @@ class TradingBot:
             print(f"[{ts()}] [{label}]  {action} {qty}x {ticker}")
 
             if ok:
+                now_dt = datetime.now()
                 if action == "BUY":
-                    self.positions[ticker]   = qty
-                    self.entry_times[ticker]  = datetime.now()
-                    # Store the price at entry for P/L tracking
                     buy_price = matrix.get(ticker, {}).get("current_price", 0.0)
+                    self.positions[ticker]    = qty
+                    self.entry_times[ticker]  = now_dt
                     if buy_price > 0:
                         self.entry_prices[ticker] = buy_price
                     buys_this_cycle += 1
                 else:
-                    self.positions[ticker]  = 0
+                    sell_price = matrix.get(ticker, {}).get("current_price", 0.0)
+                    self.positions[ticker] = 0
                     self.entry_times.pop(ticker,  None)
                     self.entry_prices.pop(ticker, None)
                     sells_this_cycle += 1
+
+                # Persist state immediately so a crash/restart doesn't lose tracking
+                self.store.save(self.positions, self.entry_times, self.entry_prices)
+                self.store.append_trade({
+                    "ts":        now_dt.isoformat(timespec="seconds"),
+                    "ticker":    ticker,
+                    "action":    action,
+                    "qty":       qty,
+                    "confidence": confidence,
+                    "reasoning": reasoning,
+                    "success":   ok,
+                })
 
     # ─────────────────────────────────────────────────────────────────────────────
     def _check_rank_guard(self) -> bool:
@@ -337,7 +373,7 @@ class TradingBot:
 
     # ─────────────────────────────────────────────────────────────────────────────
     def run(self) -> None:
-        print(f"[{ts()}] [System] Bot active.")
+        print(f"[{ts()}] [System] Bot active. Competition ends in {_days_remaining()} day(s).")
         try:
             while True:
                 open_now   = is_market_open()
@@ -351,21 +387,44 @@ class TradingBot:
                 if not open_now:
                     print(f"[{ts()}] [System] Market closed — crypto-only cycle.")
 
-                print(f"[{ts()}] [System] -- Batch Cycle Start --")
+                days_left = _days_remaining()
+                print(f"[{ts()}] [System] -- Batch Cycle Start -- ({days_left} days left)")
+
+                # ── Rank check + leaderboard snapshot (once per cycle) ────────
+                rank = self.hands.sync_rank()
+                if rank is not None:
+                    self._current_rank = rank
+                rank_str = f"#{self._current_rank}" if self._current_rank else "unknown"
+                print(f"[{ts()}] [Rank] Leaderboard position: {rank_str}")
+
+                # Every 4th cycle (~2h) pull the full leaderboard table to see the gap
+                if not hasattr(self, "_cycle_count"):
+                    self._cycle_count = 0
+                self._cycle_count += 1
+                if self._cycle_count % 4 == 1:
+                    board = self.hands.scrape_leaderboard_details(top_n=10)
+                    if board:
+                        print(f"[{ts()}] [Board] Top {len(board)} standings:")
+                        for entry in board[:10]:
+                            print(f"         #{entry['rank']:>2}  {entry['name']:<20}  "
+                                  f"value={entry['portfolio_value']}  gain={entry['gain_pct']}")
+                    else:
+                        print(f"[{ts()}] [Board] Could not retrieve leaderboard details.")
 
                 # Macro context (VIX + SPY 5d trend) — once per cycle
                 macro = self.eyes.fetch_macro_context()
                 print(f"[{ts()}] [Macro] VIX: {macro['VIX']} | SPY 5D: {macro['SPY_5D_Trend_Pct']}%")
 
                 # Refresh positions each cycle (prevents naked sells if you trade manually).
-                # Explicitly zero out any ticker that is no longer in the synced data so
-                # that manually-closed positions don't trigger ghost SELL orders next cycle.
                 known = self.mega_universe or [t for cls, tickers in WATCHLIST.items() for t in tickers]
                 seeded = self.hands.sync_positions(known_tickers=known)
                 for t in known:
                     if t in seeded:
                         self.positions[t] = seeded[t]
-                    else:
+                    elif t not in self.positions:
+                        self.positions[t] = 0
+                    elif seeded is not None and t not in seeded:
+                        # Position no longer shows in StockTrak — clear it
                         self.positions[t] = 0
 
                 # PHASE 1: Ingest all data (no OpenAI calls)
@@ -379,14 +438,19 @@ class TradingBot:
                     time.sleep(CYCLE_SLEEP_SECONDS)
                     continue
 
-                # PHASE 2: ONE batch OpenAI call (matrix + macro context)
+                # PHASE 2: ONE batch OpenAI call with competition context
                 owned = [t for t, qty in self.positions.items() if qty > 0]
                 if not open_now:
-                    # Filter out non-crypto owned assets so AI doesn't try to sell them
                     class_map = {t: cls for cls, tickers in WATCHLIST.items() for t in tickers}
                     owned = [t for t in owned if class_map.get(t, "stocks") == "crypto" or t.endswith("-USD")]
 
-                decisions = self.brain.analyze_portfolio(matrix, macro, owned_assets=owned)
+                decisions = self.brain.analyze_portfolio(
+                    matrix,
+                    macro,
+                    owned_assets=owned,
+                    current_rank=self._current_rank,
+                    days_remaining=days_left,
+                )
 
                 if not decisions:
                     print(f"[{ts()}] [Warning] No decisions returned from OpenAI.")
@@ -394,19 +458,20 @@ class TradingBot:
                     decisions, warnings = sanitize_decisions(decisions, matrix, owned_assets=owned)
                     for w in warnings:
                         print(f"[{ts()}] [Decision][Warn] {w}")
-                    # PHASE 3: Execute trades — but ask first if we're in top N
+                    # PHASE 3: Execute trades (rank guard now defaults to 'allow')
                     if self._check_rank_guard():
                         self._execute_decisions(decisions, market_open=open_now, matrix=matrix)
                     else:
-                        # Still print signals so user can see what was planned
                         for d in decisions:
                             if d.get("action") in ("BUY", "SELL"):
                                 print(f"[{ts()}] [Skipped] {d['action']} {d.get('ticker','')} "
-                                      f"(rank guard active, trade not placed)")
+                                      f"(rank guard active — not placed)")
 
                 print("-" * 60)
-                print(f"[{ts()}] [System] Cycle done. Next in {CYCLE_SLEEP_SECONDS // 60} min.")
-                time.sleep(CYCLE_SLEEP_SECONDS)
+                # During market hours use the configured interval; after hours sleep longer
+                sleep_secs = CYCLE_SLEEP_SECONDS if open_now else max(CYCLE_SLEEP_SECONDS, 3600)
+                print(f"[{ts()}] [System] Cycle done. Next in {sleep_secs // 60} min.")
+                time.sleep(sleep_secs)
 
         except KeyboardInterrupt:
             print(f"\n[{ts()}] [System] Shutdown requested...")
@@ -418,23 +483,29 @@ class TradingBot:
 
 
 if __name__ == "__main__":
-    # Focused universe: 20 high-quality tickers.
-    # Fewer tickers = faster scans, less yfinance churn, and tighter signal quality.
-    # The screener will send only the top 10 by volume surge to OpenAI each cycle.
+    # Competition universe: 35 tickers across mega-cap, high-beta, AI/growth, and crypto.
+    # The composite-score screener sends the top 15 hottest to OpenAI each cycle.
+    # Wide universe = we never miss a big mover; tight screener = focused, quality AI analysis.
     MEGA_UNIVERSE = [
-        # Core large-cap tech (highest liquidity, tight spreads)
+        # Mega-cap tech — liquid, move on macro/earnings, always relevant
         "AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META",
-        # High-beta / AI plays worth watching
-        "PLTR", "TSLA", "AMD", "CRWD",
-        # Defensive / dividend anchors (balance the portfolio)
-        "JNJ", "PEP", "MCD",
-        # Broad market ETFs (macro hedge)
-        "SPY", "QQQ",
-        # Crypto (always-on, 24/7 signals)
+        # High-beta AI / growth leaders — biggest upside in a rally
+        "PLTR", "TSLA", "AMD", "CRWD", "APP",
+        # Crypto-adjacent / high-volatility equities — can gap 10-30% on news
+        "MSTR", "COIN", "SMCI", "HOOD",
+        # Cloud / cybersecurity growth — consistent momentum names
+        "NET", "SNOW", "DDOG",
+        # Sector ETFs — fast exposure to macro themes
+        "SPY", "QQQ", "ARKK", "XLE", "ITA",
+        # Commodities hedge — gold runs when equities fall
+        "GLD",
+        # Crypto (24/7 — always on, captures overnight gaps)
         "BTC-USD", "ETH-USD", "SOL-USD",
-        # Commodities / sector hedge
-        "GLD", "XLE",
+        # Defensive anchors — rotate into these when VIX spikes
+        "JNJ", "PEP", "MCD",
+        # Additional high-momentum speculative names
+        "IONQ", "RKLB",
     ]
 
-    bot = TradingBot(mega_universe=MEGA_UNIVERSE, top_n=10)
+    bot = TradingBot(mega_universe=MEGA_UNIVERSE, top_n=15)
     bot.run()

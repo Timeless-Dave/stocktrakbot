@@ -880,6 +880,97 @@ class StockTrakExecutor:
         print("[Executor][Debug] Could not determine rank from any rankings page.")
         return None
 
+    # ─────────────────────────────────────────────────────────────────────────
+    def scrape_leaderboard_details(self, top_n: int = 15) -> list[dict]:
+        """
+        Scrape the top-N leaderboard rows and return structured data.
+        Each entry: { rank, name, portfolio_value, gain_pct }
+        Useful for knowing exactly how far ahead #1 is and whether competitors
+        near us are trading aggressively.
+
+        Returns [] if the page cannot be parsed.
+        """
+        if not self.logged_in:
+            return []
+
+        rank_urls = [
+            "https://app.stocktrak.com/account/ranking",
+            "https://app.stocktrak.com/leaderboard",
+            "https://app.stocktrak.com/account/rankings",
+        ]
+
+        for url in rank_urls:
+            try:
+                self._page.goto(url, wait_until="domcontentloaded", timeout=20_000)
+                time.sleep(1.5)
+                self._dismiss_overlays()
+
+                rows_data: list[dict] = []
+                try:
+                    rows_data = self._page.evaluate(f"""
+                    () => {{
+                        const results = [];
+                        const tables = document.querySelectorAll("table");
+                        for (const tbl of tables) {{
+                            const ths = Array.from(tbl.querySelectorAll("th"));
+                            if (!ths.length) continue;
+                            const headers = ths.map(h => h.innerText.trim().toUpperCase());
+
+                            // Detect rank, name/username, portfolio value, gain columns
+                            const colRank  = headers.findIndex(h => h.includes("RANK") || h === "#");
+                            const colName  = headers.findIndex(h =>
+                                h.includes("NAME") || h.includes("STUDENT") || h.includes("USER") || h.includes("TRADER"));
+                            const colValue = headers.findIndex(h =>
+                                h.includes("VALUE") || h.includes("PORTFOLIO") || h.includes("TOTAL"));
+                            const colGain  = headers.findIndex(h =>
+                                h.includes("GAIN") || h.includes("RETURN") || h.includes("%") || h.includes("PROFIT"));
+
+                            if (colRank === -1 && colName === -1) continue;
+
+                            const bodyRows = tbl.querySelectorAll("tbody tr, tr");
+                            let count = 0;
+                            for (const row of bodyRows) {{
+                                if (row.querySelector("th")) continue;
+                                const cells = row.querySelectorAll("td");
+                                if (cells.length < 2) continue;
+
+                                const getCell = (idx) => idx >= 0 && cells[idx]
+                                    ? cells[idx].innerText.trim() : "";
+
+                                const rankTxt  = getCell(colRank  >= 0 ? colRank  : 0);
+                                const nameTxt  = getCell(colName  >= 0 ? colName  : 1);
+                                const valueTxt = getCell(colValue >= 0 ? colValue : -1);
+                                const gainTxt  = getCell(colGain  >= 0 ? colGain  : -1);
+
+                                const rankNum = parseInt(rankTxt.replace(/[^0-9]/g, ""), 10);
+                                if (isNaN(rankNum) || rankNum < 1) continue;
+
+                                results.push({{
+                                    rank:            rankNum,
+                                    name:            nameTxt || "?",
+                                    portfolio_value: valueTxt || "?",
+                                    gain_pct:        gainTxt  || "?",
+                                }});
+                                if (++count >= {top_n}) break;
+                            }}
+                            if (results.length > 0) break;
+                        }}
+                        return results;
+                    }}
+                    """)
+                except Exception as e:
+                    print(f"[Executor] Leaderboard JS eval failed: {e}")
+
+                if rows_data:
+                    print(f"[Executor] Leaderboard scraped: {len(rows_data)} entries.")
+                    return rows_data
+
+            except Exception:
+                continue
+
+        print("[Executor][Debug] Could not scrape leaderboard details.")
+        return []
+
     # ── Private helpers ────────────────────────────────────────────────────────
     def _select_autocomplete(self, ticker: str) -> bool:
         """

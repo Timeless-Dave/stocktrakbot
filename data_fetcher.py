@@ -79,6 +79,10 @@ class MarketDataFetcher:
             sma50     = ta.trend.SMAIndicator(close=close, window=50).sma_indicator() \
                         if len(close) >= 50 else sma20
 
+            # Exponential MAs — react faster to recent price action than SMA
+            ema12     = ta.trend.EMAIndicator(close=close, window=12).ema_indicator()
+            ema26     = ta.trend.EMAIndicator(close=close, window=26).ema_indicator()
+
             # Bollinger Bands (20-period, 2σ)
             bb        = ta.volatility.BollingerBands(close=close, window=20, window_dev=2)
             bb_lower  = bb.bollinger_lband()
@@ -89,6 +93,14 @@ class MarketDataFetcher:
             atr       = ta.volatility.AverageTrueRange(
                             high=high, low=low, close=close, window=14
                         ).average_true_range()
+
+            # Stochastic RSI — faster momentum oscillator (catches turns earlier)
+            try:
+                stoch_rsi_obj = ta.momentum.StochRSIIndicator(close=close, window=14,
+                                                               smooth1=3, smooth2=3)
+                stoch_rsi_k = stoch_rsi_obj.stochrsi_k()
+            except Exception:
+                stoch_rsi_k = pd.Series([float("nan")] * len(close), index=close.index)
 
             # Volume vs 20-day average
             vol_sma   = ta.trend.SMAIndicator(
@@ -115,32 +127,53 @@ class MarketDataFetcher:
                 (projected_volume / avg_vol) * 100, 2
             ) if avg_vol > 0 else 0.0
 
+            # Today's intraday price change (vs prior close)
+            price_change_1d = round(
+                ((float(close.iloc[-1]) - float(close.iloc[-2])) / float(close.iloc[-2]) * 100)
+                if len(close) >= 2 else 0.0,
+                2,
+            )
+
+            # Composite momentum score (0-100): higher = stronger bullish momentum
+            # Weights: RSI position (25%) + MACD direction (25%) + volume (25%) + price trend (25%)
+            rsi_val  = _last(rsi, 2)
+            mhist    = _last(macd_hist, 4)
+            bb_p     = _last(bb_pct, 3)
+            p5d      = round(
+                ((float(close.iloc[-1]) - float(close.iloc[-5])) / float(close.iloc[-5]) * 100)
+                if len(close) >= 5 else 0.0, 2,
+            )
+            rsi_score     = max(0.0, min(100.0, rsi_val))                     # direct RSI (0-100)
+            macd_score    = max(0.0, min(100.0, 50.0 + mhist * 500))          # centered at 0
+            vol_score     = max(0.0, min(100.0, volume_surge_pct / 2.0))      # 200% surge → 100
+            trend_score   = max(0.0, min(100.0, 50.0 + p5d * 5.0))           # +2% 5d → ~60
+            composite_score = round(
+                0.25 * rsi_score + 0.25 * macd_score + 0.25 * vol_score + 0.25 * trend_score, 1
+            )
+
             entry: dict = {
-                "asset_class":    asset_class,
-                "last_updated":   datetime.now().isoformat(timespec="seconds"),
-                "current_price":  _last(close,     4),
-                "rsi_14":         _last(rsi,        2),
-                "macd":           _last(macd_line,  4),
-                "macd_signal":    _last(macd_sig,   4),
-                "macd_hist":      _last(macd_hist,  4),
-                "sma_20":         _last(sma20,       2),
-                "sma_50":         _last(sma50,       2),
-                "bb_lower":       _last(bb_lower,    2),
-                "bb_upper":       _last(bb_upper,    2),
-                "bb_pct":         _last(bb_pct,      3),  # 0=lower band, 1=upper band
-                "atr_14":         _last(atr,         4),  # Average True Range
-                "volume":         int(current_vol),
-                "volume_vs_avg":  round(
-                    current_vol / avg_vol,
-                    2,
-                ),
-                "volume_surge_pct": volume_surge_pct,  # e.g. 200 = 2x 20-day avg volume
-                "price_change_5d": round(
-                    ((float(close.iloc[-1]) - float(close.iloc[-5]))
-                     / float(close.iloc[-5]) * 100)
-                    if len(close) >= 5 else 0.0,
-                    2,
-                ),
+                "asset_class":      asset_class,
+                "last_updated":     datetime.now().isoformat(timespec="seconds"),
+                "current_price":    _last(close,       4),
+                "price_change_1d":  price_change_1d,                  # today's % move
+                "price_change_5d":  p5d,
+                "rsi_14":           _last(rsi,          2),
+                "stoch_rsi_k":      _last(stoch_rsi_k,  2),           # 0-1 stochastic RSI
+                "macd":             _last(macd_line,    4),
+                "macd_signal":      _last(macd_sig,     4),
+                "macd_hist":        _last(macd_hist,    4),
+                "ema_12":           _last(ema12,         2),           # fast EMA
+                "ema_26":           _last(ema26,         2),           # slow EMA
+                "sma_20":           _last(sma20,         2),
+                "sma_50":           _last(sma50,         2),
+                "bb_lower":         _last(bb_lower,      2),
+                "bb_upper":         _last(bb_upper,      2),
+                "bb_pct":           _last(bb_pct,        3),          # 0=lower band, 1=upper band
+                "atr_14":           _last(atr,           4),
+                "volume":           int(current_vol),
+                "volume_vs_avg":    round(current_vol / avg_vol, 2),
+                "volume_surge_pct": volume_surge_pct,                  # e.g. 200 = 2× 20d avg
+                "composite_score":  composite_score,                   # 0-100 momentum composite
             }
 
             # ── Fundamentals + News (equities, ETFs, bonds) ───────────────────
@@ -205,9 +238,11 @@ class MarketDataFetcher:
             print("[Ingest][Warning] Screener returned no usable data.")
             return {}
 
+        # Rank by composite_score (blended momentum) rather than volume alone.
+        # This surfaces genuinely trending assets, not just noisy high-volume tickers.
         ranked = sorted(
             results.keys(),
-            key=lambda k: float(results[k].get("volume_surge_pct") or 0.0),
+            key=lambda k: float(results[k].get("composite_score") or 0.0),
             reverse=True,
         )
         top = ranked[: max(top_n, 1)]
