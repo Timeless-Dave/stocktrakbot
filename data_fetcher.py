@@ -1,8 +1,14 @@
 """
 data_fetcher.py – The Eyes
 Technical + fundamental data for all asset classes.
-Indicators: RSI-14, MACD, SMA-20/50, Bollinger Bands, ATR-14, volume ratio.
+Indicators: RSI-14, MACD, EMA-12/26, SMA-20/50, Bollinger Bands, ATR-14,
+            Stochastic RSI, volume ratio, composite momentum score.
 Fundamentals: P/E (trailing + forward), news headlines.
+
+Interval note: with DATA_INTERVAL="1h" all indicators operate on hourly bars,
+making them highly responsive to intraday price action. SMA-20 = last 20 hours
+(~2.5 trading days), SMA-50 = last 50 hours (~6 trading days). Ideal for a
+bot cycling every 30 minutes.
 """
 import yfinance as yf
 import pandas as pd
@@ -10,6 +16,12 @@ import ta
 from datetime import datetime
 import pytz
 import concurrent.futures
+
+try:
+    from config import DATA_INTERVAL, DATA_PERIOD
+except ImportError:
+    DATA_INTERVAL = "1h"
+    DATA_PERIOD   = "60d"
 
 
 class MarketDataFetcher:
@@ -46,17 +58,22 @@ class MarketDataFetcher:
         self,
         ticker: str,
         asset_class: str = "stocks",
-        period: str = "3mo",
-        interval: str = "1d",
+        period: str | None = None,
+        interval: str | None = None,
     ) -> dict | None:
         """
         Download OHLCV + fundamentals, compute technicals, cache & return a
         flat dict ready for the OpenAI prompt.
+
+        period/interval default to DATA_PERIOD/DATA_INTERVAL from config.
+        Pass explicit values to override (e.g. screener pre-pass).
         """
-        print(f"[Data] Fetching {asset_class.upper()} data for {ticker}...")
+        _period   = period   or DATA_PERIOD
+        _interval = interval or DATA_INTERVAL
+        print(f"[Data] Fetching {asset_class.upper()} data for {ticker} ({_interval}/{_period})...")
         try:
             tkr = yf.Ticker(ticker)
-            df: pd.DataFrame = tkr.history(period=period, interval=interval)
+            df: pd.DataFrame = tkr.history(period=_period, interval=_interval)
 
             if df.empty:
                 print(f"[Data][Error] No price history returned for {ticker}.")
@@ -102,7 +119,7 @@ class MarketDataFetcher:
             except Exception:
                 stoch_rsi_k = pd.Series([float("nan")] * len(close), index=close.index)
 
-            # Volume vs 20-day average
+            # Volume vs 20-period average (20 bars regardless of interval)
             vol_sma   = ta.trend.SMAIndicator(
                             close=volume.astype(float), window=20
                         ).sma_indicator()
@@ -111,21 +128,26 @@ class MarketDataFetcher:
                 v = s.iloc[-1]
                 return round(float(v) if not pd.isna(v) else 0.0, dec)
 
-            # Volume surge: project full-day volume using intraday run-rate, then compare to 20d avg.
-            avg_vol = max(_last(vol_sma, 2), 1)
+            avg_vol     = max(_last(vol_sma, 2), 1)
             current_vol = float(volume.iloc[-1])
 
-            # Intraday volume extrapolation to full 390-minute session
+            # Volume surge calculation depends on interval:
+            # - On "1h": each bar is one hour. Compare current bar's volume to the
+            #   average hourly bar volume (vol_sma). No intraday extrapolation needed.
+            # - On "1d": the current bar is partial — extrapolate to full session.
             tz = pytz.timezone("US/Eastern")
             now = datetime.now(tz)
-            market_open = now.replace(hour=9, minute=30, second=0, microsecond=0)
-            minutes_open = (now - market_open).total_seconds() / 60.0
-            minutes_open = max(1.0, min(minutes_open, 390.0))
-            projected_volume = current_vol * (390.0 / minutes_open)
 
-            volume_surge_pct = round(
-                (projected_volume / avg_vol) * 100, 2
-            ) if avg_vol > 0 else 0.0
+            if _interval == "1h":
+                # Current hourly bar vs average hourly bar
+                volume_surge_pct = round((current_vol / avg_vol) * 100, 2) if avg_vol > 0 else 0.0
+            else:
+                # Daily candle: project to full 390-min session
+                market_open_dt = now.replace(hour=9, minute=30, second=0, microsecond=0)
+                minutes_open = (now - market_open_dt).total_seconds() / 60.0
+                minutes_open = max(1.0, min(minutes_open, 390.0))
+                projected_volume = current_vol * (390.0 / minutes_open)
+                volume_surge_pct = round((projected_volume / avg_vol) * 100, 2) if avg_vol > 0 else 0.0
 
             # Today's intraday price change (vs prior close)
             price_change_1d = round(

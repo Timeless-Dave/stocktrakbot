@@ -88,6 +88,14 @@ COMPETITION_END_DATE: str = os.getenv("COMPETITION_END_DATE", "2026-05-16")
 # Assumed starting capital for position sizing ($100K is StockTrak default).
 POSITION_BASE_CAPITAL: float = float(os.getenv("POSITION_BASE_CAPITAL", "100000"))
 
+# ── Data fetch interval ───────────────────────────────────────────────────────
+# "1h" gives intraday-responsive indicators (RSI/MACD react to hourly candles).
+# "1d" gives classic daily indicators (slower, smoother).
+# For a 30-min cycle bot, "1h" is recommended — signals are fresh every cycle.
+# yfinance limit: 1h data available up to 730 days back; "60d" period is safe.
+DATA_INTERVAL: str = os.getenv("DATA_INTERVAL", "1h")
+DATA_PERIOD: str    = os.getenv("DATA_PERIOD",   "60d")
+
 # ── Validation ────────────────────────────────────────────────────────────────
 def validate_config() -> None:
     missing = []

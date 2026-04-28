@@ -1,0 +1,1 @@
+{"action": "SELL", "confidence": 80, "qty": 92.6572, "reasoning": "SOL-USD is below both the 20-day and 50-day SMAs with a negative MACD histogram, indicating a momentum breakdown and potential further downside.", "success": true, "ticker": "SOL-USD", "ts": "2026-04-28T06:38:44"}

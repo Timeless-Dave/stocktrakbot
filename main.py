@@ -271,15 +271,16 @@ class TradingBot:
                     print(f"[{ts()}] [Skip]   Missing price data for {ticker}, cannot size BUY.")
                     continue
 
-                # Target 12% of base capital per position, scaled by confidence.
-                # 95% conf = 0.95 × 12,000 = $11,400. Cap at $14,000 to stay within
-                # StockTrak's typical 15% max-position limit on a $100K portfolio.
-                target_dollars = POSITION_BASE_CAPITAL * 0.12
-                allocation_dollars = min((confidence / 100.0) * target_dollars, 14_000.0)
+                # StockTrak hard limit: single-position value must not cause
+                # (order total + existing open position total) to exceed the
+                # max position size (~10% of starting balance = ~$9,900).
+                # We always use the full allowed allocation — at 72%+ confidence
+                # there's no reason to size down further.
+                MAX_POSITION_DOLLARS = 9_900.0
                 if asset_class == "crypto":
-                    qty = round(allocation_dollars / price, 4)
+                    qty = round(MAX_POSITION_DOLLARS / price, 4)
                 else:
-                    qty = max(1, int(allocation_dollars / price))
+                    qty = max(1, int(MAX_POSITION_DOLLARS / price))
 
             ok = self.hands.execute_trade(
                 ticker, action, qty,
